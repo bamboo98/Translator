@@ -1131,47 +1131,69 @@ class MainWindow(QMainWindow):
     
     def update_recognition_text(self, text: str, is_final: bool = False) -> None:
         """
-        更新识别文本
+        更新识别文本（倒序显示，最新在上）
         
         Args:
             text: 识别文本
             is_final: 是否为最终结果
         """
+        from datetime import datetime
+        
         if is_final:
-            # 最终结果：追加新行
+            # 最终结果：插入到顶部（倒序）
+            current_time = datetime.now().strftime("%H:%M")
+            timestamped_text = f"[{current_time}] {text}"
+            
             current_text = self.recognition_text.toPlainText()
+            # 保存当前滚动条位置（顶部应该是0）
+            scroll_pos = self.recognition_text.verticalScrollBar().value()
+            
             if current_text:
-                self.recognition_text.append(f"\n{text}")
+                # 插入到顶部
+                self.recognition_text.setPlainText(f"{timestamped_text}\n{current_text}")
             else:
-                self.recognition_text.setText(text)
-            # 滚动到底部
-            self.recognition_text.verticalScrollBar().setValue(
-                self.recognition_text.verticalScrollBar().maximum()
-            )
+                self.recognition_text.setText(timestamped_text)
+            
+            # 保持滚动条位置
+            self.recognition_text.verticalScrollBar().setValue(scroll_pos)
         else:
-            # 部分结果：更新最后一行
+            # 部分结果：更新第一行（最上面的行）
             current_text = self.recognition_text.toPlainText()
             lines = current_text.split('\n')
-            if lines and not lines[-1].strip():
-                lines.pop()
-            if lines:
-                lines[-1] = text
+            
+            # 保存当前滚动条位置
+            scroll_pos = self.recognition_text.verticalScrollBar().value()
+            
+            if lines and lines[0].strip():
+                # 检查第一行是否有时间戳，如果有则保留时间戳
+                first_line = lines[0]
+                if first_line.startswith('[') and ']' in first_line:
+                    # 提取时间戳部分
+                    time_end = first_line.find(']')
+                    timestamp = first_line[:time_end + 1]
+                    lines[0] = f"{timestamp} {text}"
+                else:
+                    # 没有时间戳，添加新的时间戳
+                    current_time = datetime.now().strftime("%H:%M")
+                    lines[0] = f"[{current_time}] {text}"
             else:
-                lines = [text]
-            self.recognition_text.setText('\n'.join(lines))
-            # 滚动到底部
-            self.recognition_text.verticalScrollBar().setValue(
-                self.recognition_text.verticalScrollBar().maximum()
-            )
+                # 没有内容，创建新行
+                current_time = datetime.now().strftime("%H:%M")
+                lines = [f"[{current_time}] {text}"]
+            
+            self.recognition_text.setPlainText('\n'.join(lines))
+            # 保持滚动条位置在顶部（0）
+            self.recognition_text.verticalScrollBar().setValue(0)
     
     def update_translation_text(self, text: str) -> None:
         """
-        更新翻译文本（完整句子，更新最近和历史）
+        更新翻译文本（完整句子，更新最近和历史，倒序显示，最新在上）
         
         Args:
             text: 翻译文本
         """
         import re
+        from datetime import datetime
         
         # 移除权重前缀（格式：数字+|分隔符，例如 "85|这是翻译结果"）
         cleaned_text = text
@@ -1183,16 +1205,22 @@ class MainWindow(QMainWindow):
         # 更新最近一次翻译
         self.translation_latest_text.setText(cleaned_text)
         
-        # 更新翻译历史（追加到历史记录）
+        # 更新翻译历史（插入到顶部，倒序）
+        current_time = datetime.now().strftime("%H:%M")
+        timestamped_text = f"[{current_time}] {cleaned_text}"
+        
         current_history = self.translation_history_text.toPlainText()
+        # 保存当前滚动条位置（顶部应该是0）
+        scroll_pos = self.translation_history_text.verticalScrollBar().value()
+        
         if current_history:
-            self.translation_history_text.append(f"\n{cleaned_text}")
+            # 插入到顶部
+            self.translation_history_text.setPlainText(f"{timestamped_text}\n{current_history}")
         else:
-            self.translation_history_text.setText(cleaned_text)
-        # 滚动到底部
-        self.translation_history_text.verticalScrollBar().setValue(
-            self.translation_history_text.verticalScrollBar().maximum()
-        )
+            self.translation_history_text.setText(timestamped_text)
+        
+        # 保持滚动条位置在顶部（0）
+        self.translation_history_text.verticalScrollBar().setValue(0)
     
     def update_translation_latest_text_only(self, text: str) -> None:
         """
@@ -1230,20 +1258,28 @@ class MainWindow(QMainWindow):
     
     def update_recognition_text_for_test(self, text: str) -> None:
         """
-        为测试更新识别文本（模拟识别结果）
+        为测试更新识别文本（模拟识别结果，倒序显示，最新在上）
         
         Args:
             text: 识别文本
         """
+        from datetime import datetime
+        
+        current_time = datetime.now().strftime("%H:%M")
+        timestamped_text = f"[{current_time}] {text}"
+        
         current_text = self.recognition_text.toPlainText()
+        # 保存当前滚动条位置（顶部应该是0）
+        scroll_pos = self.recognition_text.verticalScrollBar().value()
+        
         if current_text:
-            self.recognition_text.append(f"\n{text}")
+            # 插入到顶部（倒序）
+            self.recognition_text.setPlainText(f"{timestamped_text}\n{current_text}")
         else:
-            self.recognition_text.setText(text)
-        # 滚动到底部
-        self.recognition_text.verticalScrollBar().setValue(
-            self.recognition_text.verticalScrollBar().maximum()
-        )
+            self.recognition_text.setText(timestamped_text)
+        
+        # 保持滚动条位置
+        self.recognition_text.verticalScrollBar().setValue(scroll_pos)
     
     def set_listening_state(self, listening: bool) -> None:
         """设置监听状态"""
