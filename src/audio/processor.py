@@ -149,11 +149,21 @@ class AudioProcessor:
         # 如果RMS很小但峰值较大，说明有突发音频
         # 使用两者的加权平均
         if rms > 0 or peak > 0:
-            # 将RMS和峰值都转换为0-100的百分比
+            # 将RMS和峰值都转换为0-100的百分比（线性）
             rms_percent = min(100, rms * 100)
             peak_percent = min(100, peak * 100)
-            # 使用加权平均（RMS权重0.7，峰值权重0.3）
-            volume = rms_percent * 0.7 + peak_percent * 0.3
+            linear_volume = rms_percent * 0.7 + peak_percent * 0.3
+            
+            # 使用对数曲线映射，提高低音量时的灵敏度
+            # 使用 log(1 + v * scale) / log(1 + 100 * scale) * 100
+            # scale 控制曲线陡峭程度，值越大低音量越敏感
+            scale = 0.15  # 可调整参数，范围0.1-0.3，值越大低音量越敏感
+            if linear_volume > 0:
+                # 对数映射：低音量时增长快，高音量时增长慢
+                log_volume = np.log1p(linear_volume * scale) / np.log1p(100 * scale) * 100
+                volume = min(100, log_volume)
+            else:
+                volume = 0.0
         else:
             volume = 0.0
         

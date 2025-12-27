@@ -13,29 +13,32 @@ class AudioCapture:
     def __init__(self, 
                  sample_rate: int = 16000,
                  channels: int = 1,
-                 chunk_size: int = 1024,
+                 process_interval_seconds: float = 3.0,
                  format: str = "int16",
                  callback: Optional[Callable[[bytes], None]] = None,
                  volume_callback: Optional[Callable[[float], None]] = None,
-                 device_index: Optional[int] = None):
+                 device_index: Optional[int] = None,
+                 volume_threshold: float = 1.0):
         """
         初始化音频捕获
         
         Args:
-            sample_rate: 采样率
+            sample_rate: 目标采样率（用于Vosk）
             channels: 声道数
-            chunk_size: 每次读取的帧数
+            process_interval_seconds: 处理间隔（秒），默认3秒
             format: 音频格式
             callback: 音频数据回调函数（接收累积的音频块）
             volume_callback: 音量回调函数（接收音量值0-100）
             device_index: 设备索引，如果为None则自动查找CABLE设备
+            volume_threshold: 音量阈值（0-100），低于此值不传递给识别模型
         """
         self.sample_rate = sample_rate  # 目标采样率（用于Vosk）
         self.channels = channels
-        self.chunk_size = chunk_size
+        self.process_interval_seconds = process_interval_seconds
         self.format = format
         self.callback = callback
         self.volume_callback = volume_callback
+        self.volume_threshold = volume_threshold
         
         self.audio = pyaudio.PyAudio()
         self.stream: Optional[pyaudio.Stream] = None
@@ -45,10 +48,13 @@ class AudioCapture:
         # 实际使用的采样率（可能与目标采样率不同）
         self.actual_sample_rate = sample_rate
         
+        # chunk_size 和 process_interval 将在 start() 中根据实际采样率动态计算
+        self.chunk_size = None
+        self.process_interval = None
+        
         # 分块累积处理相关
         self.frames = []  # 累积的音频帧
         self.frame_count = 0
-        self.process_interval = (sample_rate * 3) // chunk_size  # 每3秒处理一次
         
         # 查找CABLE设备
         if device_index is None:
@@ -201,8 +207,8 @@ class AudioCapture:
             self.frame_count = 0
             self.frame_volumes = []
             
-            # 如果平均音量 <= 1%，不传递给识别模型
-            if avg_volume <= 1.0:
+            # 如果平均音量 <= 阈值，不传递给识别模型
+            if avg_volume <= self.volume_threshold:
                 return (None, pyaudio.paContinue)
             
             # 如果实际采样率与目标采样率不同，进行重采样
@@ -312,7 +318,25 @@ class AudioCapture:
             for try_rate in try_sample_rates:
                 try:
                     print(f"尝试采样率: {try_rate}Hz")
-                    # 打开音频流
+                    
+                    # 保存实际使用的采样率
+                    self.actual_sample_rate = try_rate
+                    
+                    # 根据实际采样率动态计算chunk_size（每次读取约0.1秒的数据）
+                    # 这样可以保证回调频率适中，不会太频繁也不会太慢
+                    self.chunk_size = int(self.actual_sample_rate * 0.1)
+                    # 确保chunk_size在合理范围内（最小1024，最大8192）
+                    self.chunk_size = max(1024, min(8192, self.chunk_size))
+                    
+                    # 根据处理间隔秒数和采样率计算需要累积多少帧
+                    # 例如：48000Hz * 3秒 = 144000帧，需要累积这么多帧后处理一次
+                    total_frames_for_interval = int(self.actual_sample_rate * self.process_interval_seconds)
+                    self.process_interval = total_frames_for_interval // self.chunk_size
+                    # 确保至少累积1帧
+                    if self.process_interval < 1:
+                        self.process_interval = 1
+                    
+                    # 打开音频流，使用计算出的chunk_size
                     self.stream = self.audio.open(
                         format=pyaudio_format,
                         channels=actual_channels,
@@ -324,10 +348,11 @@ class AudioCapture:
                         start=False
                     )
                     
-                    # 保存实际使用的采样率
-                    self.actual_sample_rate = try_rate
                     stream_opened = True
                     print(f"采样率配置成功: {try_rate}Hz")
+                    print(f"处理间隔配置: {self.process_interval_seconds}秒")
+                    print(f"Chunk大小: {self.chunk_size} 帧（约{self.chunk_size/self.actual_sample_rate:.3f}秒）")
+                    print(f"处理间隔: 每{self.process_interval}个chunk（约{self.process_interval * self.chunk_size / self.actual_sample_rate:.2f}秒）处理一次")
                     break
                     
                 except Exception as e:
@@ -358,7 +383,6 @@ class AudioCapture:
             print(f"音频捕获已启动: [{self.device_index}] {device_name}")
             print(f"  - 捕获配置: {actual_channels}声道, {self.actual_sample_rate}Hz, {self.format}")
             print(f"  - 目标配置: {self.channels}声道, {self.sample_rate}Hz (用于Vosk)")
-            print(f"  - 音频处理间隔: 每{self.process_interval}帧（约3秒）处理一次")
             if self.actual_sample_rate != self.sample_rate or actual_channels != self.channels:
                 print(f"  - 将自动进行格式转换（重采样/声道转换）")
             

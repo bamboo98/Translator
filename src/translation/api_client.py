@@ -259,23 +259,30 @@ class TranslationClient:
         self._ensure_client_for_current_loop()
         
         import json
+        import time
         request_data = None
         try:
             request_data = self._build_request_data(text, context_prompt, last_text)
             
             try:
+                post_start_time = time.time()
                 response = await self.client.post(
                     self.api_url,
                     json=request_data
                 )
+                post_time = time.time() - post_start_time
+                # print(f"[完整翻译] client.post实际耗时: {post_time:.3f}秒")
             except RuntimeError as e:
                 # 如果遇到事件循环绑定错误，重新创建客户端并重试
                 if "bound to a different event loop" in str(e):
                     self._init_client()
+                    post_start_time = time.time()
                     response = await self.client.post(
                         self.api_url,
                         json=request_data
                     )
+                    post_time = time.time() - post_start_time
+                    # print(f"[完整翻译] client.post实际耗时(重试): {post_time:.3f}秒")
                 else:
                     raise
             
@@ -445,23 +452,30 @@ class TranslationClient:
         self._ensure_client_for_current_loop()
         
         import json
+        import time
         request_data = None
         try:
             request_data = self._build_request_data_with_prompt(prompt)
             
             try:
+                post_start_time = time.time()
                 response = await self.client.post(
                     self.api_url,
                     json=request_data
                 )
+                post_time = time.time() - post_start_time
+                # print(f"[即时翻译] client.post实际耗时: {post_time:.3f}秒")
             except RuntimeError as e:
                 # 如果遇到事件循环绑定错误，重新创建客户端并重试
                 if "bound to a different event loop" in str(e):
                     self._init_client()
+                    post_start_time = time.time()
                     response = await self.client.post(
                         self.api_url,
                         json=request_data
                     )
+                    post_time = time.time() - post_start_time
+                    # print(f"[即时翻译] client.post实际耗时(重试): {post_time:.3f}秒")
                 else:
                     raise
             

@@ -23,13 +23,18 @@ class MainWindow(QMainWindow):
     translation_start_signal = pyqtSignal()  # 开启翻译
     translation_stop_signal = pyqtSignal()  # 关闭翻译
     language_changed_signal = pyqtSignal(str)  # 语言改变（仅用于下拉框选择，不加载模型）
-    device_changed_signal = pyqtSignal(int)  # 设备索引
+    device_changed_signal = pyqtSignal(int)  # 设备索引（已废弃，保留兼容性）
+    input_device_changed_signal = pyqtSignal(int)  # 输入设备索引
+    loopback_device_changed_signal = pyqtSignal(int)  # 桌面音频设备索引
+    device_type_changed_signal = pyqtSignal(str)  # 设备类型改变信号 ("input" 或 "loopback")
     refresh_devices_signal = pyqtSignal()  # 刷新设备列表
+    volume_threshold_changed_signal = pyqtSignal(float)  # 音量阈值改变信号
     volume_updated_signal = pyqtSignal(float)  # 音量更新信号
     recognition_text_updated_signal = pyqtSignal(str, bool)  # 识别文本更新信号 (text, is_final)
     translation_text_updated_signal = pyqtSignal(str)  # 翻译文本更新信号（完整句子，更新最近和历史）
     translation_latest_text_updated_signal = pyqtSignal(str)  # 即时翻译文本更新信号（只更新最近）
     instant_translate_changed_signal = pyqtSignal(bool)  # 即时翻译设置改变信号
+    translation_status_updated_signal = pyqtSignal(bool, bool, list)  # 翻译状态更新信号 (is_translating, is_waiting, translate_times)
     manual_translate_signal = pyqtSignal(str)  # 手动翻译信号
     status_message_signal = pyqtSignal(str, int)  # 状态栏消息信号 (message, timeout_ms)
     apply_settings_signal = pyqtSignal()  # 应用设置信号（会重启程序）
@@ -49,6 +54,9 @@ class MainWindow(QMainWindow):
         self.is_recognizing = False
         self.is_translating = False
         self.model_folders = []  # 初始化模型文件夹列表
+        
+        # 连接翻译状态更新信号
+        self.translation_status_updated_signal.connect(self.update_translation_status)
         
         self.init_ui()
         self.apply_config()
@@ -273,15 +281,17 @@ class MainWindow(QMainWindow):
         channels_layout.addStretch()
         layout.addLayout(channels_layout)
         
-        # 块大小
-        chunk_layout = QHBoxLayout()
-        chunk_layout.addWidget(QLabel("块大小:"))
-        self.audio_chunk_size_spin = QSpinBox()
-        self.audio_chunk_size_spin.setRange(256, 8192)
-        self.audio_chunk_size_spin.setValue(audio_config.get("chunk_size", 1024))
-        chunk_layout.addWidget(self.audio_chunk_size_spin)
-        chunk_layout.addStretch()
-        layout.addLayout(chunk_layout)
+        # 处理间隔（秒）
+        interval_layout = QHBoxLayout()
+        interval_layout.addWidget(QLabel("处理间隔 (秒):"))
+        self.audio_process_interval_spin = QDoubleSpinBox()
+        self.audio_process_interval_spin.setRange(0.5, 10.0)
+        self.audio_process_interval_spin.setSingleStep(0.5)
+        self.audio_process_interval_spin.setValue(audio_config.get("process_interval_seconds", 3.0))
+        self.audio_process_interval_spin.setDecimals(1)
+        interval_layout.addWidget(self.audio_process_interval_spin)
+        interval_layout.addStretch()
+        layout.addLayout(interval_layout)
         
         # 音频格式
         format_layout = QHBoxLayout()
@@ -432,24 +442,43 @@ class MainWindow(QMainWindow):
     
     def _create_device_panel(self) -> QGroupBox:
         """创建音频设备选择面板"""
+        from PyQt6.QtWidgets import QRadioButton
+        
         group = QGroupBox("音频设备")
         layout = QVBoxLayout()
         
-        # 设备选择下拉菜单
-        device_layout = QHBoxLayout()
-        device_layout.addWidget(QLabel("输入设备:"))
-        self.device_combo = QComboBox()
-        self.device_combo.setMinimumWidth(300)
-        self.device_combo.currentIndexChanged.connect(self._on_device_changed)
-        device_layout.addWidget(self.device_combo)
+        # 第一行：输入设备
+        input_device_layout = QHBoxLayout()
+        self.input_device_radio = QRadioButton("输入设备:")
+        self.input_device_radio.setChecked(True)  # 默认选择输入设备
+        self.input_device_radio.toggled.connect(lambda checked: self._on_device_type_changed("input") if checked else None)
+        input_device_layout.addWidget(self.input_device_radio)
+        self.input_device_combo = QComboBox()
+        self.input_device_combo.setMinimumWidth(300)
+        self.input_device_combo.currentIndexChanged.connect(self._on_input_device_changed)
+        input_device_layout.addWidget(self.input_device_combo)
+        input_device_layout.addStretch()
+        layout.addLayout(input_device_layout)
+        
+        # 第二行：桌面音频
+        loopback_device_layout = QHBoxLayout()
+        self.loopback_device_radio = QRadioButton("桌面音频:")
+        self.loopback_device_radio.toggled.connect(lambda checked: self._on_device_type_changed("loopback") if checked else None)
+        loopback_device_layout.addWidget(self.loopback_device_radio)
+        self.loopback_device_combo = QComboBox()
+        self.loopback_device_combo.setMinimumWidth(300)
+        self.loopback_device_combo.currentIndexChanged.connect(self._on_loopback_device_changed)
+        loopback_device_layout.addWidget(self.loopback_device_combo)
+        loopback_device_layout.addStretch()
+        layout.addLayout(loopback_device_layout)
         
         # 刷新按钮
+        refresh_layout = QHBoxLayout()
         refresh_btn = QPushButton("刷新")
         refresh_btn.clicked.connect(self.refresh_devices_signal.emit)
-        device_layout.addWidget(refresh_btn)
-        
-        device_layout.addStretch()
-        layout.addLayout(device_layout)
+        refresh_layout.addWidget(refresh_btn)
+        refresh_layout.addStretch()
+        layout.addLayout(refresh_layout)
         
         group.setLayout(layout)
         return group
@@ -476,6 +505,21 @@ class MainWindow(QMainWindow):
         
         control_layout.addStretch()
         layout.addLayout(control_layout)
+        
+        # 第二行：音量阈值设置
+        threshold_layout = QHBoxLayout()
+        threshold_layout.addWidget(QLabel("音量阈值:"))
+        self.volume_threshold_spin = QDoubleSpinBox()
+        self.volume_threshold_spin.setRange(0.0, 100.0)
+        self.volume_threshold_spin.setSingleStep(0.5)
+        self.volume_threshold_spin.setValue(self.config.get("audio.volume_threshold", 1.0))
+        self.volume_threshold_spin.setDecimals(1)
+        self.volume_threshold_spin.setSuffix("%")
+        self.volume_threshold_spin.valueChanged.connect(self._on_volume_threshold_changed)
+        threshold_layout.addWidget(self.volume_threshold_spin)
+        threshold_layout.addWidget(QLabel("(低于此值不传递给识别模型)"))
+        threshold_layout.addStretch()
+        layout.addLayout(threshold_layout)
         
         group.setLayout(layout)
         return group
@@ -520,6 +564,13 @@ class MainWindow(QMainWindow):
         """扫描models文件夹，找到所有有效的模型并更新下拉框"""
         from pathlib import Path
         
+        # 在开始扫描之前，先断开信号连接，避免在clear()和addItem()时触发信号
+        try:
+            self.language_combo.currentIndexChanged.disconnect()
+        except TypeError:
+            # 如果信号未连接，忽略错误
+            pass
+        
         self.language_combo.clear()
         self.model_folders = []  # 存储模型文件夹名称
         
@@ -530,6 +581,8 @@ class MainWindow(QMainWindow):
         if not model_path.exists():
             self.language_combo.addItem("未找到models文件夹", None)
             self.load_model_btn.setEnabled(False)
+            # 重新连接信号
+            self.language_combo.currentIndexChanged.connect(self._on_language_selected)
             return
         
         # 扫描所有目录，查找有效模型
@@ -546,16 +599,45 @@ class MainWindow(QMainWindow):
         if len(self.model_folders) == 0:
             self.language_combo.addItem("未找到有效模型", None)
             self.load_model_btn.setEnabled(False)
+            # 重新连接信号
+            self.language_combo.currentIndexChanged.connect(self._on_language_selected)
         else:
             self.load_model_btn.setEnabled(True)
             # 尝试选择之前选择的模型（如果有）
             saved_language = vosk_config.get("language", "")
             if saved_language:
+                # 信号已经在方法开始时断开，这里不需要再次断开
                 # 尝试找到匹配的模型
+                found = False
                 for i in range(self.language_combo.count()):
                     if self.language_combo.itemData(i) == saved_language:
                         self.language_combo.setCurrentIndex(i)
+                        found = True
                         break
+                
+                # 重新连接信号
+                # 注意：如果没找到匹配的模型，currentIndex仍然是0（第一个模型）
+                # 重新连接信号时，如果currentIndex是0，可能会触发_on_language_selected
+                # 但_on_language_selected中已经检查了：如果配置中的language已经是这个值，就不保存
+                # 所以如果找不到匹配的模型，currentIndex是0（cn模型），而配置中是ja模型
+                # 重新连接信号时可能会触发_on_language_selected，将配置改为cn模型
+                # 为了安全起见，在重新连接信号之前，先检查当前索引对应的模型是否与保存的模型匹配
+                current_index = self.language_combo.currentIndex()
+                current_model = self.language_combo.itemData(current_index) if current_index >= 0 else None
+                
+                # 如果找到了匹配的模型，或者当前索引对应的模型与保存的模型匹配，才重新连接信号
+                # 如果没找到匹配的模型，且当前索引对应的模型与保存的模型不匹配，说明配置中的模型不存在
+                # 此时不应该重新连接信号，避免触发_on_language_selected覆盖配置
+                if found or (current_model == saved_language):
+                    self.language_combo.currentIndexChanged.connect(self._on_language_selected)
+                else:
+                    # 没找到匹配的模型，且当前索引对应的模型与保存的模型不匹配
+                    # 不重新连接信号，避免触发_on_language_selected覆盖配置
+                    # 但这样用户后续选择模型时不会保存，所以还是需要重新连接
+                    # 使用blockSignals来临时阻止信号触发
+                    self.language_combo.blockSignals(True)
+                    self.language_combo.currentIndexChanged.connect(self._on_language_selected)
+                    self.language_combo.blockSignals(False)
     
     def _create_recognition_control_panel(self) -> QGroupBox:
         """创建识别控制面板"""
@@ -567,6 +649,11 @@ class MainWindow(QMainWindow):
         self.recognition_btn.setEnabled(False)  # 初始禁用，需要监听和模型都准备好
         layout.addWidget(self.recognition_btn)
         
+        # 清空按钮移到开启识别按钮后面
+        self.clear_texts_btn = QPushButton("清空")
+        self.clear_texts_btn.clicked.connect(self._on_clear_texts_clicked)
+        layout.addWidget(self.clear_texts_btn)
+        
         layout.addStretch()
         
         group.setLayout(layout)
@@ -577,26 +664,22 @@ class MainWindow(QMainWindow):
         group = QGroupBox("翻译")
         layout = QVBoxLayout()
         
-        # 第一行：翻译按钮和手动输入
+        # 第一行：翻译按钮、状态圆点和耗时统计
         control_layout = QHBoxLayout()
         self.translation_btn = QPushButton("开启翻译")
         self.translation_btn.clicked.connect(self._on_translation_clicked)
         self.translation_btn.setEnabled(False)  # 初始禁用，需要识别开启
         control_layout.addWidget(self.translation_btn)
         
-        control_layout.addWidget(QLabel("手动测试:"))
-        self.manual_input = QLineEdit()
-        self.manual_input.setPlaceholderText("输入要翻译的文本...")
-        self.manual_input.setMinimumWidth(200)
-        control_layout.addWidget(self.manual_input)
+        # 状态圆点
+        self.translation_status_label = QLabel("●")
+        self.translation_status_label.setStyleSheet("color: #888; font-size: 16px;")
+        control_layout.addWidget(self.translation_status_label)
         
-        self.test_translate_btn = QPushButton("测试翻译")
-        self.test_translate_btn.clicked.connect(self._on_test_translate_clicked)
-        control_layout.addWidget(self.test_translate_btn)
-        
-        self.clear_texts_btn = QPushButton("清空")
-        self.clear_texts_btn.clicked.connect(self._on_clear_texts_clicked)
-        control_layout.addWidget(self.clear_texts_btn)
+        # 耗时统计标签
+        self.translation_time_label = QLabel("")
+        self.translation_time_label.setStyleSheet("color: #888; font-size: 12px;")
+        control_layout.addWidget(self.translation_time_label)
         
         control_layout.addStretch()
         layout.addLayout(control_layout)
@@ -610,6 +693,21 @@ class MainWindow(QMainWindow):
         instant_layout.addWidget(self.instant_translate_checkbox)
         instant_layout.addStretch()
         layout.addLayout(instant_layout)
+        
+        # 第三行：手动测试
+        manual_layout = QHBoxLayout()
+        manual_layout.addWidget(QLabel("手动测试:"))
+        self.manual_input = QLineEdit()
+        self.manual_input.setPlaceholderText("输入要翻译的文本...")
+        self.manual_input.setMinimumWidth(200)
+        manual_layout.addWidget(self.manual_input)
+        
+        self.test_translate_btn = QPushButton("测试翻译")
+        self.test_translate_btn.clicked.connect(self._on_test_translate_clicked)
+        manual_layout.addWidget(self.test_translate_btn)
+        
+        manual_layout.addStretch()
+        layout.addLayout(manual_layout)
         
         group.setLayout(layout)
         return group
@@ -735,12 +833,22 @@ class MainWindow(QMainWindow):
     def _on_language_selected(self, index: int) -> None:
         """模型选择改变事件（仅记录选择，不加载模型）"""
         model_folder = self.language_combo.itemData(index)
-        if model_folder:
-            # 保存选择的模型文件夹名称
-            vosk_config = self.config.get_vosk_config()
-            vosk_config["language"] = model_folder
-            self.config.set("vosk.language", model_folder)
-            self.config.save()
+        if not model_folder:
+            return
+        
+        # 检查是否是用户主动选择（而不是初始化时的设置）
+        # 如果当前配置中的language已经是这个值，说明是初始化时设置的，不需要保存
+        vosk_config = self.config.get_vosk_config()
+        current_saved_language = vosk_config.get("language", "")
+        if current_saved_language == model_folder:
+            # 配置已经是这个值，可能是初始化时设置的，不需要重复保存
+            return
+        
+        # 保存选择的模型文件夹名称
+        vosk_config["language"] = model_folder
+        self.config.set("vosk.language", model_folder)
+        self.config.save()
+        print(f"模型选择已保存: {model_folder}")
     
     def _on_load_model_clicked(self) -> None:
         """加载模型按钮点击事件"""
@@ -788,10 +896,30 @@ class MainWindow(QMainWindow):
         self.status_bar.showMessage(message, timeout)
     
     def _on_device_changed(self, index: int) -> None:
-        """设备选择改变事件"""
+        """设备选择改变事件（已废弃，保留兼容性）"""
         device_index = self.device_combo.itemData(index)
         if device_index is not None:
             self.device_changed_signal.emit(device_index)
+    
+    def _on_input_device_changed(self, index: int) -> None:
+        """输入设备选择改变事件"""
+        device_index = self.input_device_combo.itemData(index)
+        if device_index is not None:
+            self.input_device_changed_signal.emit(device_index)
+    
+    def _on_loopback_device_changed(self, index: int) -> None:
+        """桌面音频设备选择改变事件"""
+        device_index = self.loopback_device_combo.itemData(index)
+        if device_index is not None:
+            self.loopback_device_changed_signal.emit(device_index)
+    
+    def _on_device_type_changed(self, device_type: str) -> None:
+        """设备类型改变事件"""
+        self.device_type_changed_signal.emit(device_type)
+    
+    def _on_volume_threshold_changed(self, value: float) -> None:
+        """音量阈值改变事件"""
+        self.volume_threshold_changed_signal.emit(value)
     
     def update_volume(self, volume: float) -> None:
         """
@@ -825,18 +953,25 @@ class MainWindow(QMainWindow):
             }}
         """)
     
-    def update_device_list(self, devices: list, default_index: Optional[int] = None) -> None:
+    def update_device_list(self, input_devices: list, loopback_devices: list, 
+                          default_input_index: Optional[int] = None,
+                          default_loopback_index: Optional[int] = None,
+                          device_type: str = "input") -> None:
         """
         更新设备列表
         
         Args:
-            devices: 设备列表，每个设备是字典，包含index和name
-            default_index: 默认选择的设备索引
+            input_devices: 输入设备列表，每个设备是字典，包含index和name
+            loopback_devices: 桌面音频设备列表，每个设备是字典，包含index和name
+            default_input_index: 默认选择的输入设备索引
+            default_loopback_index: 默认选择的桌面音频设备索引
+            device_type: 当前设备类型 ("input" 或 "loopback")
         """
-        self.device_combo.clear()
-        self.device_indices = []
+        # 更新输入设备列表
+        self.input_device_combo.clear()
+        self.input_device_indices = []
         
-        for device in devices:
+        for device in input_devices:
             device_idx = device.get('index')
             device_name = device.get('name', 'Unknown')
             is_cable = device.get('isCABLE', False)
@@ -846,21 +981,48 @@ class MainWindow(QMainWindow):
             if is_cable:
                 display_name += " (CABLE)"
             
-            self.device_combo.addItem(display_name, device_idx)
-            self.device_indices.append(device_idx)
+            self.input_device_combo.addItem(display_name, device_idx)
+            self.input_device_indices.append(device_idx)
             
             # 如果是CABLE设备或默认设备，设置为当前选择
-            if default_index is None and is_cable:
-                default_index = device_idx
+            if default_input_index is None and is_cable:
+                default_input_index = device_idx
         
-        # 设置默认选择
-        if default_index is not None:
+        # 设置输入设备默认选择
+        if default_input_index is not None:
             try:
-                idx = self.device_indices.index(default_index)
-                self.device_combo.setCurrentIndex(idx)
+                idx = self.input_device_indices.index(default_input_index)
+                self.input_device_combo.setCurrentIndex(idx)
             except ValueError:
-                if self.device_combo.count() > 0:
-                    self.device_combo.setCurrentIndex(0)
+                pass
+        
+        # 更新桌面音频设备列表
+        self.loopback_device_combo.clear()
+        self.loopback_device_indices = []
+        
+        for device in loopback_devices:
+            device_idx = device.get('index')
+            device_name = device.get('name', 'Unknown')
+            
+            # 格式化显示名称
+            display_name = f"[{device_idx}] {device_name}"
+            
+            self.loopback_device_combo.addItem(display_name, device_idx)
+            self.loopback_device_indices.append(device_idx)
+        
+        # 设置桌面音频设备默认选择
+        if default_loopback_index is not None:
+            try:
+                idx = self.loopback_device_indices.index(default_loopback_index)
+                self.loopback_device_combo.setCurrentIndex(idx)
+            except ValueError:
+                pass
+        
+        # 设置设备类型单选按钮
+        if device_type == "input":
+            self.input_device_radio.setChecked(True)
+        else:
+            self.loopback_device_radio.setChecked(True)
     
     def update_recognition_text(self, text: str, is_final: bool = False) -> None:
         """
@@ -1048,6 +1210,40 @@ class MainWindow(QMainWindow):
         else:
             self.translation_btn.setText("开启翻译")
             self.translation_btn.setStyleSheet("")
+    
+    def update_translation_status(self, is_translating: bool, is_waiting: bool, translate_times: list) -> None:
+        """
+        更新翻译状态显示（圆点和耗时统计）
+        
+        Args:
+            is_translating: 是否正在翻译
+            is_waiting: 是否正在等待服务器返回
+            translate_times: 最近20次翻译请求的耗时列表
+        """
+        if not is_translating:
+            # 灰色：未启动翻译
+            self.translation_status_label.setStyleSheet("color: #888; font-size: 28px;")
+            self.translation_time_label.setText("")
+        elif is_waiting:
+            # 黄色：有正在等待服务器返回的翻译请求
+            self.translation_status_label.setStyleSheet("color: #ff9800; font-size: 28px;")
+            # 计算并显示耗时统计
+            if translate_times:
+                avg_time = sum(translate_times) / len(translate_times)
+                max_time = max(translate_times)
+                self.translation_time_label.setText(f"平均耗时({avg_time:.1f}秒) 最大耗时({max_time:.1f}秒)")
+            else:
+                self.translation_time_label.setText("")
+        else:
+            # 绿色：当前没有任何翻译请求
+            self.translation_status_label.setStyleSheet("color: #4caf50; font-size: 28px;")
+            # 计算并显示耗时统计
+            if translate_times:
+                avg_time = sum(translate_times) / len(translate_times)
+                max_time = max(translate_times)
+                self.translation_time_label.setText(f"平均耗时({avg_time:.1f}秒) 最大耗时({max_time:.1f}秒)")
+            else:
+                self.translation_time_label.setText("")
     
     def _update_recognition_button_state(self) -> None:
         """更新识别按钮的启用状态"""

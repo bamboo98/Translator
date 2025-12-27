@@ -10,6 +10,7 @@ from PyQt6.QtCore import QTimer, pyqtSlot, QMetaObject, Qt
 
 from config import Config
 from src.audio.capture_cable import AudioCapture
+from src.audio.capture_loopback import LoopbackAudioCapture
 from src.recognition.vosk_engine import VoskEngine
 from src.translation.api_client import TranslationClient
 from src.translation.context_manager import WeightedContextManager
@@ -24,6 +25,7 @@ class TranslatorApp:
         
         # 初始化各个模块
         self.audio_capture: Optional[AudioCapture] = None
+        self.loopback_capture: Optional[LoopbackAudioCapture] = None
         self.vosk_engine: Optional[VoskEngine] = None
         self.translation_client: Optional[TranslationClient] = None
         # 初始化上下文管理器（使用配置）
@@ -43,7 +45,11 @@ class TranslatorApp:
         self.pending_translate_request: Optional[dict] = None  # 等待中的请求：{"text": str, "type": "instant"/"full", "context_prompt": str, "last_text": str}
         self.is_waiting_for_response = False  # 是否正在等待上一个请求返回
         self.last_translate_time = 0.0  # 上次翻译完成时间
-        self.translate_thread: Optional[threading.Thread] = None  # 单个翻译工作线程
+        self.translate_thread: Optional[threading.Thread] = None  # 常驻翻译工作线程
+        self.translate_thread_stop = threading.Event()  # 用于停止线程
+        self.translate_request_event = threading.Event()  # 用于通知有新请求
+        self.translate_thread_running = False  # 线程运行状态
+        self.translate_times = []  # 最近20次翻译请求的耗时列表
         
         # 创建GUI
         self.app = QApplication(sys.argv)
@@ -67,7 +73,11 @@ class TranslatorApp:
         self.window.translation_start_signal.connect(self.start_translation)
         self.window.translation_stop_signal.connect(self.stop_translation)
         # 不再需要language_changed_signal，UI自己处理
-        self.window.device_changed_signal.connect(self._on_device_changed)
+        self.window.device_changed_signal.connect(self._on_device_changed)  # 保留兼容性
+        self.window.input_device_changed_signal.connect(self._on_input_device_changed)
+        self.window.loopback_device_changed_signal.connect(self._on_loopback_device_changed)
+        self.window.device_type_changed_signal.connect(self._on_device_type_changed)
+        self.window.volume_threshold_changed_signal.connect(self._on_volume_threshold_changed)
         self.window.refresh_devices_signal.connect(self._refresh_devices)
         self.window.volume_updated_signal.connect(self.window.update_volume)
         self.window.recognition_text_updated_signal.connect(self.window.update_recognition_text)
@@ -84,36 +94,74 @@ class TranslatorApp:
         try:
             # 初始化音频捕获
             audio_config = self.config.get_audio_config()
+            device_type = audio_config.get("device_type", "input")
             device_index = audio_config.get("device_index")
+            loopback_device_index = audio_config.get("loopback_device_index")
+            process_interval_seconds = audio_config.get("process_interval_seconds", 3.0)
+            volume_threshold = audio_config.get("volume_threshold", 1.0)
             
-            # 先创建临时AudioCapture对象以获取设备列表（不启动流）
+            # 获取输入设备列表
+            input_devices = []
             try:
-                # 创建临时对象获取设备列表
                 temp_capture = AudioCapture(
                     sample_rate=audio_config.get("sample_rate", 16000),
                     channels=audio_config.get("channels", 1),
-                    chunk_size=audio_config.get("chunk_size", 1024),
+                    process_interval_seconds=process_interval_seconds,
                     format=audio_config.get("format", "int16"),
                     device_index=None  # 不指定设备，只用于获取列表
                 )
-                # 获取设备列表并更新GUI
-                devices = temp_capture.get_available_devices()
-                self.window.update_device_list(devices, device_index)
+                input_devices = temp_capture.get_available_devices()
                 temp_capture.close()
             except Exception as e:
-                print(f"获取设备列表失败: {e}")
-                # 继续初始化，使用默认设备
+                print(f"获取输入设备列表失败: {e}")
             
-            # 创建实际的音频捕获对象
-            self.audio_capture = AudioCapture(
-                sample_rate=audio_config.get("sample_rate", 16000),
-                channels=audio_config.get("channels", 1),
-                chunk_size=audio_config.get("chunk_size", 1024),
-                format=audio_config.get("format", "int16"),
-                callback=self._on_audio_chunk,  # 改为处理累积的音频块
-                volume_callback=self._on_volume_update,  # 音量更新回调
-                device_index=device_index
+            # 获取桌面音频设备列表
+            loopback_devices = []
+            try:
+                temp_loopback = LoopbackAudioCapture(
+                    sample_rate=audio_config.get("sample_rate", 16000),
+                    channels=audio_config.get("channels", 1),
+                    process_interval_seconds=process_interval_seconds,
+                    format=audio_config.get("format", "int16"),
+                    device_index=None
+                )
+                loopback_devices = temp_loopback.get_available_devices()
+                temp_loopback.close()
+            except Exception as e:
+                print(f"获取桌面音频设备列表失败: {e}")
+            
+            # 更新GUI设备列表
+            self.window.update_device_list(
+                input_devices, 
+                loopback_devices,
+                default_input_index=device_index,
+                default_loopback_index=loopback_device_index,
+                device_type=device_type
             )
+            
+            # 根据设备类型创建对应的捕获对象（但不立即启动）
+            if device_type == "input" and device_index is not None:
+                self.audio_capture = AudioCapture(
+                    sample_rate=audio_config.get("sample_rate", 16000),
+                    channels=audio_config.get("channels", 1),
+                    process_interval_seconds=process_interval_seconds,
+                    format=audio_config.get("format", "int16"),
+                    callback=self._on_audio_chunk,
+                    volume_callback=self._on_volume_update,
+                    device_index=device_index,
+                    volume_threshold=volume_threshold
+                )
+            elif device_type == "loopback" and loopback_device_index is not None:
+                self.loopback_capture = LoopbackAudioCapture(
+                    sample_rate=audio_config.get("sample_rate", 16000),
+                    channels=audio_config.get("channels", 1),
+                    process_interval_seconds=process_interval_seconds,
+                    format=audio_config.get("format", "int16"),
+                    callback=self._on_audio_chunk,
+                    volume_callback=self._on_volume_update,
+                    device_index=loopback_device_index,
+                    volume_threshold=volume_threshold
+                )
             
             # 不立即初始化Vosk引擎，等用户点击加载模型按钮
             self.vosk_engine: Optional[VoskEngine] = None
@@ -203,31 +251,40 @@ class TranslatorApp:
             context_prompt: 上下文提示词（仅完整翻译使用）
             last_text: 上一句话（仅完整翻译使用）
         """
-        # 覆盖规则：
-        # 1. 完整翻译可以覆盖等待中的即时翻译
-        # 2. 即时翻译不能覆盖等待中的完整翻译
-        # 3. 后一个即时翻译可以覆盖前一个尚未进行请求的即时翻译
+        # 新的覆盖规则：
+        # 1. 请求完整翻译时：
+        #    - 如果当前pending_translate_request是完整翻译，则合并text到末尾（添加\n）
+        #    - 如果当前pending_translate_request是即时翻译，则直接覆盖
+        # 2. 请求即时翻译时：
+        #    - 如果当前pending_translate_request是完整翻译，则抛弃即时翻译请求
+        #    - 如果当前是即时翻译，则直接覆盖
         
         if request_type == "full":
-            # 完整翻译：可以覆盖任何等待中的请求
-            self.pending_translate_request = {
-                "text": text,
-                "type": "full",
-                "context_prompt": context_prompt,
-                "last_text": last_text
-            }
-        elif request_type == "instant":
-            # 即时翻译：
-            # - 如果正在等待响应，不能覆盖
-            # - 如果等待中的是完整翻译，不能覆盖
-            # - 如果等待中的是即时翻译，可以覆盖
-            if self.is_waiting_for_response:
-                # 正在等待响应，不能覆盖
-                return
+            # 完整翻译请求
             if self.pending_translate_request and self.pending_translate_request["type"] == "full":
-                # 等待中的是完整翻译，不能覆盖
+                # 如果当前是完整翻译，合并text到末尾（添加\n）
+                existing_text = self.pending_translate_request.get("text", "")
+                merged_text = existing_text + "\n" + text if existing_text else text
+                self.pending_translate_request = {
+                    "text": merged_text,
+                    "type": "full",
+                    "context_prompt": context_prompt,  # 使用新的context_prompt
+                    "last_text": last_text  # 使用新的last_text
+                }
+            else:
+                # 如果当前是即时翻译或没有请求，直接覆盖
+                self.pending_translate_request = {
+                    "text": text,
+                    "type": "full",
+                    "context_prompt": context_prompt,
+                    "last_text": last_text
+                }
+        elif request_type == "instant":
+            # 即时翻译请求
+            if self.pending_translate_request and self.pending_translate_request["type"] == "full":
+                # 如果当前是完整翻译，抛弃即时翻译请求
                 return
-            # 可以覆盖（包括空请求和即时翻译请求）
+            # 如果当前是即时翻译或没有请求，直接覆盖
             self.pending_translate_request = {
                 "text": text,
                 "type": "instant",
@@ -235,243 +292,273 @@ class TranslatorApp:
                 "last_text": ""
             }
         
-        # 如果当前没有等待响应，立即处理请求
-        if not self.is_waiting_for_response:
-            self._process_translate_request()
+        # 如果有待处理的请求且没有正在等待响应，通知工作线程
+        if self.pending_translate_request and not self.is_waiting_for_response:
+            self.translate_request_event.set()
     
-    def _process_translate_request(self) -> None:
-        """处理等待中的翻译请求"""
-        if not self.pending_translate_request:
-            return
+    def _parse_translation_result(self, result: str) -> tuple[int, str]:
+        """
+        解析翻译结果，提取权重和翻译文本
         
-        if not self.translation_client or not self.translation_client.api_key:
-            print("警告: API密钥未设置，无法翻译")
-            self.pending_translate_request = None
-            return
-        
-        # 获取请求信息
-        request = self.pending_translate_request
-        self.pending_translate_request = None  # 清空等待中的请求
-        self.is_waiting_for_response = True  # 标记为正在等待响应
-        
-        # 在新线程中执行翻译
-        def translate_worker():
-            import re
-            import time
-            import json
+        Args:
+            result: AI模型返回的原始字符串
             
-            # 记录请求数据
-            request_data = {
-                "type": request["type"],
-                "text": request["text"],
-                "context_prompt": request.get("context_prompt", ""),
-                "last_text": request.get("last_text", "")
-            }
+        Returns:
+            tuple: (weight, translation_text)
+                - weight: 权重值（100-199，其中100+ai_weight）
+                - translation_text: 翻译结果文本
+        """
+        import json
+        import re
+        
+        # 1. 先尝试JSON解码
+        try:
+            result_stripped = result.strip()
+            # 移除可能的代码块标记（```json ... ```）
+            # 匹配 ```json 或 ``` 开头和 ``` 结尾
+            code_block_pattern = r'^```(?:json)?\s*\n?(.*?)\n?```\s*$'
+            code_block_match = re.match(code_block_pattern, result_stripped, re.DOTALL)
+            if code_block_match:
+                # 提取代码块中的内容
+                result_stripped = code_block_match.group(1).strip()
             
-            try:
-                if request["type"] == "full":
-                    # 完整翻译
-                    result = self.translation_client.translate(
-                        request["text"],
-                        request["context_prompt"],
-                        request["last_text"]
-                    )
-                    if result:
-                        # 解析翻译结果，提取权重
-                        weight = 100  # 默认权重
-                        translation_text = result
-                        
-                        # 尝试匹配开头的权重格式：数字+|分隔符
-                        weight_match = re.match(r'^(\d{1,2})\|', result.strip())
-                        if weight_match:
-                            ai_weight = int(weight_match.group(1))
-                            if 0 <= ai_weight <= 99:
-                                weight = 100 + ai_weight  # 权重范围：100-199
-                                # 移除权重前缀，只保留翻译结果
-                                translation_text = result[weight_match.end():].strip()
-                        
-                        # 将原文和权重保存到上下文管理器
-                        self.context_manager.add_context(request["text"], weight=weight)
-                        
-                        # 发送翻译结果到UI
-                        self.window.translation_text_updated_signal.emit(translation_text)
-                    else:
-                        print(f"翻译失败: 返回结果为空")
-                        print(f"请求数据: {json.dumps(request_data, ensure_ascii=False, indent=2)}")
-                        self.window.status_message_signal.emit("翻译失败: 返回结果为空", 5000)
+            # 尝试解析JSON
+            parsed = json.loads(result_stripped)
+            if isinstance(parsed, dict):
+                # 提取翻译文本，优先使用 "t" 字段
+                translation_text = None
+                if "t" in parsed:
+                    translation_text = parsed["t"]
+                elif "text" in parsed:
+                    translation_text = parsed["text"]
+                elif "translation" in parsed:
+                    translation_text = parsed["translation"]
+                
+                # 如果都没有找到，使用整个JSON字符串
+                if translation_text is None:
+                    translation_text = result_stripped
                 else:
-                    # 即时翻译
-                    trans_config = self.config.get_translation_config()
-                    instant_prompt_template = trans_config.get("instant_prompt_template", "")
+                    # 确保是字符串类型
+                    translation_text = str(translation_text)
+                
+                # 提取权重值（可选）
+                ai_weight = parsed.get("v", 0)
+                if not isinstance(ai_weight, int) or ai_weight < 0 or ai_weight > 99:
+                    ai_weight = 0
+                
+                weight = 100 + ai_weight  # 权重范围：100-199
+                return weight, translation_text
+        except (json.JSONDecodeError, ValueError, TypeError):
+            # JSON解析失败，继续尝试其他方式
+            pass
+        
+        # 2. 尝试使用|分隔符的解析方案
+        weight_match = re.match(r'^(\d{1,2})\|', result.strip())
+        if weight_match:
+            ai_weight = int(weight_match.group(1))
+            if 0 <= ai_weight <= 99:
+                weight = 100 + ai_weight  # 权重范围：100-199
+                # 移除权重前缀，只保留翻译结果
+                translation_text = result[weight_match.end():].strip()
+                return weight, translation_text
+        
+        # 3. 如果以上解析都不能完成，默认权重为0，将整个返回字符串作为翻译结果
+        weight = 100  # 默认权重（100 + 0）
+        translation_text = result.strip()
+        return weight, translation_text
+    
+    def _translate_worker_loop(self) -> None:
+        """常驻翻译工作线程的主循环"""
+        import re
+        import time
+        import json
+        import asyncio
+        
+        # 为这个线程创建持久的事件循环
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        try:
+            while not self.translate_thread_stop.is_set():
+                # 等待翻译请求或停止信号（每0.1秒检查一次）
+                if self.translate_request_event.wait(timeout=0.1):
+                    # 有新的翻译请求
+                    self.translate_request_event.clear()
                     
-                    if not instant_prompt_template:
-                        instant_prompt_template = trans_config.get("prompt_template", "")
-                    
-                    # 构建即时翻译提示词
-                    if instant_prompt_template:
-                        prompt = instant_prompt_template.replace("{text}", request["text"])
-                        prompt = prompt.replace("{context}", "当前新对话")
-                        prompt = prompt.replace("{last}", "")
-                    else:
-                        prompt = f"翻译以下文本为中文：{request['text']}"
-                    
-                    # 记录即时翻译的提示词
-                    request_data["prompt"] = prompt
-                    
-                    result = self.translation_client.translate_with_prompt(request["text"], prompt)
-                    
-                    if result:
-                        # 移除权重前缀（如果有）
-                        translation_text = result
-                        weight_match = re.match(r'^(\d{1,2})\|', result.strip())
-                        if weight_match:
-                            translation_text = result[weight_match.end():].strip()
+                    # 处理翻译请求
+                    if self.pending_translate_request and self.is_translating:
+                        request = self.pending_translate_request
+                        self.pending_translate_request = None  # 清空等待中的请求
+                        self.is_waiting_for_response = True
+                        # 更新UI显示状态（使用信号确保线程安全）
+                        self.window.translation_status_updated_signal.emit(self.is_translating, self.is_waiting_for_response, self.translate_times.copy())
                         
-                        # 即时翻译只更新最近一次翻译，不保存历史，不保存上下文
-                        self.window.translation_latest_text_updated_signal.emit(translation_text)
-                    else:
-                        print(f"即时翻译失败: 返回结果为空")
-                        print(f"请求数据: {json.dumps(request_data, ensure_ascii=False, indent=2)}")
-            except Exception as e:
-                print(f"翻译错误: {e}")
-                print(f"请求数据: {json.dumps(request_data, ensure_ascii=False, indent=2)}")
-                import traceback
-                traceback.print_exc()
-                if request["type"] == "full":
-                    self.window.status_message_signal.emit(f"翻译失败: {e}", 5000)
-                    self.context_manager.clear()
+                        # 检查API密钥
+                        if not self.translation_client or not self.translation_client.api_key:
+                            print("警告: API密钥未设置，无法翻译")
+                            self.is_waiting_for_response = False
+                            continue
+                        
+                        # 记录请求数据
+                        request_data = {
+                            "type": request["type"],
+                            "text": request["text"],
+                            "context_prompt": request.get("context_prompt", ""),
+                            "last_text": request.get("last_text", "")
+                        }
+                        # print(f"准备请求翻译: {request_data}")
+                        
+                        try:
+                            if request["type"] == "full":
+                                # 完整翻译 - 使用异步方法
+                                start_time = time.time()
+                                result = loop.run_until_complete(
+                                    self.translation_client.translate_async(
+                                        request["text"],
+                                        request["context_prompt"],
+                                        request["last_text"]
+                                    )
+                                )
+                                total_time = time.time() - start_time
+                                # print(f"[完整翻译] run_until_complete总耗时: {total_time:.3f}秒")
+                                # 记录耗时到统计列表
+                                self.translate_times.append(total_time)
+                                if len(self.translate_times) > 20:
+                                    self.translate_times.pop(0)
+                                # 更新UI显示（使用信号确保线程安全）
+                                self.window.translation_status_updated_signal.emit(self.is_translating, self.is_waiting_for_response, self.translate_times.copy())
+                                if result:
+                                    # 解析翻译结果，提取权重和翻译文本
+                                    weight, translation_text = self._parse_translation_result(result)
+                                    
+                                    # 将原文和权重保存到上下文管理器
+                                    self.context_manager.add_context(request["text"], weight=weight)
+                                    
+                                    # 发送翻译结果到UI
+                                    self.window.translation_text_updated_signal.emit(translation_text)
+                                else:
+                                    print(f"翻译失败: 返回结果为空")
+                                    print(f"请求数据: {json.dumps(request_data, ensure_ascii=False, indent=2)}")
+                                    self.window.status_message_signal.emit("翻译失败: 返回结果为空", 5000)
+                            else:
+                                # 即时翻译
+                                trans_config = self.config.get_translation_config()
+                                instant_prompt_template = trans_config.get("instant_prompt_template", "")
+                                
+                                if not instant_prompt_template:
+                                    instant_prompt_template = trans_config.get("prompt_template", "")
+                                
+                                # 构建即时翻译提示词
+                                if instant_prompt_template:
+                                    prompt = instant_prompt_template.replace("{text}", request["text"])
+                                    prompt = prompt.replace("{context}", "当前新对话")
+                                    prompt = prompt.replace("{last}", "")
+                                else:
+                                    prompt = f"翻译以下文本为中文：{request['text']}"
+                                
+                                # 记录即时翻译的提示词
+                                request_data["prompt"] = prompt
+                                
+                                # 即时翻译 - 使用异步方法
+                                start_time = time.time()
+                                result = loop.run_until_complete(
+                                    self.translation_client.translate_async_with_prompt(request["text"], prompt)
+                                )
+                                total_time = time.time() - start_time
+                                # print(f"[即时翻译] run_until_complete总耗时: {total_time:.3f}秒")
+                                # 记录耗时到统计列表
+                                self.translate_times.append(total_time)
+                                if len(self.translate_times) > 20:
+                                    self.translate_times.pop(0)
+                                # 更新UI显示（使用信号确保线程安全）
+                                self.window.translation_status_updated_signal.emit(self.is_translating, self.is_waiting_for_response, self.translate_times.copy())
+                                
+                                if result:
+                                    # 解析翻译结果，提取翻译文本（即时翻译不需要权重）
+                                    _, translation_text = self._parse_translation_result(result)
+                                    
+                                    # 即时翻译只更新最近一次翻译，不保存历史，不保存上下文
+                                    self.window.translation_latest_text_updated_signal.emit(translation_text)
+                                else:
+                                    print(f"即时翻译失败: 返回结果为空")
+                                    print(f"请求数据: {json.dumps(request_data, ensure_ascii=False, indent=2)}")
+                        except Exception as e:
+                            print(f"翻译错误: {e}")
+                            print(f"请求数据: {json.dumps(request_data, ensure_ascii=False, indent=2)}")
+                            import traceback
+                            traceback.print_exc()
+                            if request["type"] == "full":
+                                self.window.status_message_signal.emit(f"翻译失败: {e}", 5000)
+                                self.context_manager.clear()
+                        finally:
+                            # 记录完成时间
+                            self.last_translate_time = time.time()
+                            # 标记不再等待响应
+                            self.is_waiting_for_response = False
+                            # 更新UI显示状态（使用信号确保线程安全）
+                            self.window.translation_status_updated_signal.emit(self.is_translating, self.is_waiting_for_response, self.translate_times.copy())
+                            
+                            # 如果还有下一个待处理的请求，立即处理（不需要等待轮询）
+                            if self.pending_translate_request:
+                                self.translate_request_event.set()
+        finally:
+            # 清理事件循环
+            try:
+                # 取消所有待处理的任务
+                pending = asyncio.all_tasks(loop)
+                for task in pending:
+                    task.cancel()
+                # 等待所有任务完成
+                if pending:
+                    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            except Exception:
+                pass
             finally:
-                # 记录完成时间
-                self.last_translate_time = time.time()
-                # 标记不再等待响应
-                self.is_waiting_for_response = False
-                # 处理下一个等待中的请求（如果有）
-                if self.pending_translate_request:
-                    self._process_translate_request()
-        
-        # 启动翻译线程（应该总是创建新线程，因为is_waiting_for_response已经阻止了并发）
-        # 但在创建新线程之前，先等待旧线程完成（如果存在且仍在运行）
-        if self.translate_thread and self.translate_thread.is_alive():
-            # 等待旧线程完成，但设置超时避免无限等待
-            self.translate_thread.join(timeout=0.1)
-        
-        self.translate_thread = threading.Thread(target=translate_worker, daemon=True)
-        self.translate_thread.start()
+                loop.close()
     
     
     def _on_device_changed(self, device_index: int) -> None:
-        """设备改变回调"""
-        # 保存旧设备索引（用于错误恢复）
-        old_device_index = self.config.get("audio.device_index")
-        
-        # 保存设备选择到配置
+        """设备改变回调（已废弃，保留兼容性）"""
+        # 兼容旧代码，直接调用输入设备改变回调
+        self._on_input_device_changed(device_index)
+    
+    def _on_input_device_changed(self, device_index: int) -> None:
+        """输入设备改变回调（不立即重启监听）"""
+        # 只保存配置，不立即重启监听
         self.config.set("audio.device_index", device_index)
+        self.config.set("audio.device_type", "input")
+        self.config.save()
+        self.window.status_bar.showMessage("输入设备已选择，将在下次开启监听时生效", 2000)
+    
+    def _on_loopback_device_changed(self, device_index: int) -> None:
+        """桌面音频设备改变回调（不立即重启监听）"""
+        # 只保存配置，不立即重启监听
+        self.config.set("audio.loopback_device_index", device_index)
+        self.config.set("audio.device_type", "loopback")
+        self.config.save()
+        self.window.status_bar.showMessage("桌面音频设备已选择，将在下次开启监听时生效", 2000)
+    
+    def _on_device_type_changed(self, device_type: str) -> None:
+        """设备类型改变回调（不立即重启监听）"""
+        # 只保存配置，不立即重启监听
+        self.config.set("audio.device_type", device_type)
+        self.config.save()
+        device_type_name = "输入设备" if device_type == "input" else "桌面音频"
+        self.window.status_bar.showMessage(f"已切换到{device_type_name}，将在下次开启监听时生效", 2000)
+    
+    def _on_volume_threshold_changed(self, threshold: float) -> None:
+        """音量阈值改变回调（实时生效）"""
+        # 保存配置
+        self.config.set("audio.volume_threshold", threshold)
         self.config.save()
         
-        # 记录当前状态
-        was_listening = self.is_listening
-        was_recognizing = self.is_recognizing
-        was_translating = self.is_translating
+        # 实时更新当前捕获对象的音量阈值
+        if self.audio_capture:
+            self.audio_capture.volume_threshold = threshold
+        if self.loopback_capture:
+            self.loopback_capture.volume_threshold = threshold
         
-        try:
-            # 如果正在监听，先停止
-            if self.is_listening:
-                # 先关闭识别和翻译（如果正在运行）
-                if self.is_recognizing:
-                    self.stop_recognition()
-                if self.is_translating:
-                    self.stop_translation()
-                
-                # 停止音频捕获
-                if self.audio_capture:
-                    self.audio_capture.stop()
-                    self.audio_capture.close()
-                    self.audio_capture = None
-                self.is_listening = False
-                # 停止音频捕获后将音量显示归零
-                self.window.update_volume(0.0)
-            
-            # 重新创建音频捕获对象（使用新的设备索引）
-            audio_config = self.config.get_audio_config()
-            self.audio_capture = AudioCapture(
-                sample_rate=audio_config.get("sample_rate", 16000),
-                channels=audio_config.get("channels", 1),
-                chunk_size=audio_config.get("chunk_size", 1024),
-                format=audio_config.get("format", "int16"),
-                callback=self._on_audio_chunk,
-                volume_callback=self._on_volume_update,
-                device_index=device_index
-            )
-            
-            # 如果之前正在监听，重新启动监听
-            if was_listening:
-                self.audio_capture.start()
-                self.is_listening = True
-                self.window.set_listening_state(True)
-                
-                # 如果之前正在识别，重新启动识别
-                if was_recognizing and self.vosk_engine:
-                    self.vosk_engine.start()
-                    self.is_recognizing = True
-                    self.window.set_recognition_state(True)
-                
-                # 如果之前正在翻译，重新启动翻译
-                if was_translating:
-                    self.context_manager.clear()
-                    self.pending_translate_request = None
-                    self.is_waiting_for_response = False
-                    self.last_translate_time = 0.0
-                    self.is_translating = True
-                    self.window.set_translation_state(True)
-                
-                self.window.status_bar.showMessage("设备已切换，监听已重启", 2000)
-            else:
-                self.window.status_bar.showMessage("设备已切换", 2000)
-                
-        except Exception as e:
-            print(f"切换设备失败: {e}")
-            self.window.show_error("错误", f"切换设备失败: {e}")
-            # 如果切换失败，回滚配置并尝试恢复到之前的状态
-            if old_device_index is not None:
-                self.config.set("audio.device_index", old_device_index)
-                self.config.save()
-                # 更新UI中的设备选择（需要创建临时对象获取设备列表）
-                try:
-                    audio_config = self.config.get_audio_config()
-                    temp_capture = AudioCapture(
-                        sample_rate=audio_config.get("sample_rate", 16000),
-                        channels=audio_config.get("channels", 1),
-                        chunk_size=audio_config.get("chunk_size", 1024),
-                        format=audio_config.get("format", "int16"),
-                        device_index=None
-                    )
-                    devices = temp_capture.get_available_devices()
-                    temp_capture.close()
-                    self.window.update_device_list(devices, old_device_index)
-                except:
-                    pass
-            
-            if was_listening:
-                try:
-                    # 尝试使用旧的设备索引重新创建
-                    if old_device_index is not None:
-                        audio_config = self.config.get_audio_config()
-                        self.audio_capture = AudioCapture(
-                            sample_rate=audio_config.get("sample_rate", 16000),
-                            channels=audio_config.get("channels", 1),
-                            chunk_size=audio_config.get("chunk_size", 1024),
-                            format=audio_config.get("format", "int16"),
-                            callback=self._on_audio_chunk,
-                            volume_callback=self._on_volume_update,
-                            device_index=old_device_index
-                        )
-                        self.audio_capture.start()
-                        self.is_listening = True
-                        self.window.set_listening_state(True)
-                except Exception as restore_error:
-                    print(f"恢复旧设备失败: {restore_error}")
-                    self.is_listening = False
-                    self.window.set_listening_state(False)
+        self.window.status_bar.showMessage(f"音量阈值已更新: {threshold}%", 2000)
     
     def _on_manual_translate(self, text: str) -> None:
         """手动翻译回调"""
@@ -501,11 +588,61 @@ class TranslatorApp:
             return
         
         try:
-            if self.audio_capture:
+            audio_config = self.config.get_audio_config()
+            device_type = audio_config.get("device_type", "input")
+            device_index = audio_config.get("device_index")
+            loopback_device_index = audio_config.get("loopback_device_index")
+            process_interval_seconds = audio_config.get("process_interval_seconds", 3.0)
+            volume_threshold = audio_config.get("volume_threshold", 1.0)
+            
+            # 根据设备类型创建或使用对应的捕获对象
+            if device_type == "input":
+                if device_index is None:
+                    self.window.show_error("错误", "请先选择输入设备")
+                    return
+                
+                # 如果捕获对象不存在或设备索引不匹配，重新创建
+                if not self.audio_capture or self.audio_capture.device_index != device_index:
+                    if self.audio_capture:
+                        self.audio_capture.close()
+                    self.audio_capture = AudioCapture(
+                        sample_rate=audio_config.get("sample_rate", 16000),
+                        channels=audio_config.get("channels", 1),
+                        process_interval_seconds=process_interval_seconds,
+                        format=audio_config.get("format", "int16"),
+                        callback=self._on_audio_chunk,
+                        volume_callback=self._on_volume_update,
+                        device_index=device_index,
+                        volume_threshold=volume_threshold
+                    )
+                
                 self.audio_capture.start()
+            else:  # loopback
+                if loopback_device_index is None:
+                    self.window.show_error("错误", "请先选择桌面音频设备")
+                    return
+                
+                # 如果捕获对象不存在或设备索引不匹配，重新创建
+                if not self.loopback_capture or self.loopback_capture.device_index != loopback_device_index:
+                    if self.loopback_capture:
+                        self.loopback_capture.close()
+                    self.loopback_capture = LoopbackAudioCapture(
+                        sample_rate=audio_config.get("sample_rate", 16000),
+                        channels=audio_config.get("channels", 1),
+                        process_interval_seconds=process_interval_seconds,
+                        format=audio_config.get("format", "int16"),
+                        callback=self._on_audio_chunk,
+                        volume_callback=self._on_volume_update,
+                        device_index=loopback_device_index,
+                        volume_threshold=volume_threshold
+                    )
+                
+                self.loopback_capture.start()
+            
             self.is_listening = True
             self.window.set_listening_state(True)
-            self.window.status_bar.showMessage("监听已开启", 2000)
+            device_type_name = "输入设备" if device_type == "input" else "桌面音频"
+            self.window.status_bar.showMessage(f"监听已开启 ({device_type_name})", 2000)
         except Exception as e:
             print(f"开启监听失败: {e}")
             self.window.show_error("错误", f"开启监听失败: {e}")
@@ -524,6 +661,9 @@ class TranslatorApp:
             
             if self.audio_capture:
                 self.audio_capture.stop()
+            if self.loopback_capture:
+                self.loopback_capture.stop()
+            
             self.is_listening = False
             self.window.set_listening_state(False)
             # 关闭监听后将音量显示归零
@@ -652,9 +792,19 @@ class TranslatorApp:
             self.is_waiting_for_response = False
             self.last_translate_time = 0.0
             self.is_translating = True
+            
+            # 启动常驻翻译线程（如果还没有启动）
+            if not self.translate_thread_running:
+                self.translate_thread_stop.clear()
+                self.translate_thread_running = True
+                self.translate_thread = threading.Thread(target=self._translate_worker_loop, daemon=True)
+                self.translate_thread.start()
+            
             self.window.set_translation_state(True)
             # 开启翻译时只清空翻译文本框和上下文缓存
             self.window.clear_translation_texts()
+            # 更新状态显示（使用信号确保线程安全）
+            self.window.translation_status_updated_signal.emit(self.is_translating, self.is_waiting_for_response, self.translate_times.copy())
             self.window.status_bar.showMessage("翻译已开启", 2000)
         except Exception as e:
             print(f"开启翻译失败: {e}")
@@ -668,17 +818,12 @@ class TranslatorApp:
         try:
             # 清空等待中的请求
             self.pending_translate_request = None
-            # 等待当前翻译完成（最多等待2秒）
-            if self.translate_thread and self.translate_thread.is_alive():
-                self.translate_thread.join(timeout=2.0)
-                # 如果线程仍在运行，说明超时了，但daemon线程会在主程序退出时自动终止
-                if self.translate_thread.is_alive():
-                    print("警告: 翻译线程未在超时时间内完成，但daemon线程会在程序退出时自动终止")
-            
             self.is_translating = False
             self.is_waiting_for_response = False
-            self.translate_thread = None  # 清空线程引用
+            # 注意：不停止常驻线程，让它继续运行等待下次开启翻译
             self.window.set_translation_state(False)
+            # 更新状态显示（使用信号确保线程安全）
+            self.window.translation_status_updated_signal.emit(self.is_translating, self.is_waiting_for_response, self.translate_times.copy())
             # 关闭翻译时不清空任何文本框
             self.window.status_bar.showMessage("翻译已关闭", 2000)
         except Exception as e:
@@ -687,24 +832,56 @@ class TranslatorApp:
     def _refresh_devices(self) -> None:
         """刷新设备列表"""
         try:
-            if self.audio_capture:
-                devices = self.audio_capture.get_available_devices()
-                current_device = self.config.get("audio.device_index")
-                self.window.update_device_list(devices, current_device)
-            else:
-                # 如果音频捕获未初始化，创建临时对象获取设备列表
-                audio_config = self.config.get_audio_config()
-                temp_capture = AudioCapture(
-                    sample_rate=audio_config.get("sample_rate", 16000),
-                    channels=audio_config.get("channels", 1),
-                    chunk_size=audio_config.get("chunk_size", 1024),
-                    format=audio_config.get("format", "int16"),
-                    device_index=None  # 不初始化设备，只获取列表
-                )
-                devices = temp_capture.get_available_devices()
-                current_device = self.config.get("audio.device_index")
-                self.window.update_device_list(devices, current_device)
-                temp_capture.close()
+            audio_config = self.config.get_audio_config()
+            process_interval_seconds = audio_config.get("process_interval_seconds", 3.0)
+            
+            # 获取输入设备列表
+            input_devices = []
+            try:
+                if self.audio_capture and isinstance(self.audio_capture, AudioCapture):
+                    input_devices = self.audio_capture.get_available_devices()
+                else:
+                    temp_capture = AudioCapture(
+                        sample_rate=audio_config.get("sample_rate", 16000),
+                        channels=audio_config.get("channels", 1),
+                        process_interval_seconds=process_interval_seconds,
+                        format=audio_config.get("format", "int16"),
+                        device_index=None  # 不初始化设备，只用于获取列表
+                    )
+                    input_devices = temp_capture.get_available_devices()
+                    temp_capture.close()
+            except Exception as e:
+                print(f"获取输入设备列表失败: {e}")
+            
+            # 获取桌面音频设备列表
+            loopback_devices = []
+            try:
+                if self.audio_capture and isinstance(self.audio_capture, LoopbackAudioCapture):
+                    loopback_devices = self.audio_capture.get_available_devices()
+                else:
+                    temp_loopback = LoopbackAudioCapture(
+                        sample_rate=audio_config.get("sample_rate", 16000),
+                        channels=audio_config.get("channels", 1),
+                        process_interval_seconds=process_interval_seconds,
+                        format=audio_config.get("format", "int16"),
+                        device_index=None
+                    )
+                    loopback_devices = temp_loopback.get_available_devices()
+                    temp_loopback.close()
+            except Exception as e:
+                print(f"获取桌面音频设备列表失败: {e}")
+            
+            # 更新GUI设备列表
+            device_type = audio_config.get("device_type", "input")
+            default_input_index = audio_config.get("device_index")
+            default_loopback_index = audio_config.get("loopback_device_index")
+            self.window.update_device_list(
+                input_devices,
+                loopback_devices,
+                default_input_index=default_input_index,
+                default_loopback_index=default_loopback_index,
+                device_type=device_type
+            )
         except Exception as e:
             print(f"刷新设备列表失败: {e}")
             self.window.show_error("错误", f"刷新设备列表失败: {e}")
@@ -732,8 +909,8 @@ class TranslatorApp:
             #     self.config.set("audio.sample_rate", self.window.audio_sample_rate_spin.value())
             # if hasattr(self.window, 'audio_channels_spin'):
             #     self.config.set("audio.channels", self.window.audio_channels_spin.value())
-            if hasattr(self.window, 'audio_chunk_size_spin'):
-                self.config.set("audio.chunk_size", self.window.audio_chunk_size_spin.value())
+            if hasattr(self.window, 'audio_process_interval_spin'):
+                self.config.set("audio.process_interval_seconds", self.window.audio_process_interval_spin.value())
             if hasattr(self.window, 'audio_format_combo'):
                 self.config.set("audio.format", self.window.audio_format_combo.currentText())
             
@@ -815,12 +992,16 @@ class TranslatorApp:
         if self.is_listening:
             self.stop_listening()
         
-        # 确保所有翻译线程都已结束
-        if self.translate_thread and self.translate_thread.is_alive():
-            print("等待翻译线程结束...")
-            self.translate_thread.join(timeout=3.0)
-            if self.translate_thread.is_alive():
-                print("警告: 翻译线程未在超时时间内完成")
+        # 停止常驻翻译线程
+        if self.translate_thread_running:
+            self.translate_thread_stop.set()
+            self.translate_request_event.set()  # 唤醒线程以便它检查停止信号
+            if self.translate_thread and self.translate_thread.is_alive():
+                print("等待翻译线程结束...")
+                self.translate_thread.join(timeout=3.0)
+                if self.translate_thread.is_alive():
+                    print("警告: 翻译线程未在超时时间内完成")
+            self.translate_thread_running = False
         
         if self.audio_capture:
             self.audio_capture.close()

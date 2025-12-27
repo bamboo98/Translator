@@ -13,9 +13,12 @@ class Config:
         "audio": {
             "sample_rate": 16000,
             "channels": 1,
-            "chunk_size": 1024,
+            "process_interval_seconds": 3.0,  # 处理间隔（秒），默认3秒
             "format": "int16",
-            "device_index": None  # None表示自动查找CABLE设备
+            "device_index": None,  # None表示自动查找CABLE设备
+            "device_type": "input",  # "input" 或 "loopback"，表示使用输入设备还是桌面音频
+            "loopback_device_index": None,  # 桌面音频设备索引
+            "volume_threshold": 1.0  # 音量阈值（0-100），低于此值不传递给识别模型
         },
         "vosk": {
             "model_path": "models",
@@ -31,7 +34,7 @@ class Config:
             "temperature": 0.3,  # 温度参数
             "memory_max_count": 6,  # 记忆最大条数
             "memory_time": 300,  # 记忆时间（秒），默认5分钟
-            "prompt_template": "你是一个为VRChat提供实时翻译的专业同声传译助手\n- 翻译成口语化的中文,保留语气词,前文和上一句无需翻译\n- 原文为语音识别,可能存在断句问题和同/近音词错误,结合上下文推测完整且正确的语句\n- 在翻译结果开头添加0~99的整数和分隔符|来表示该段翻译的重要性,越大会在前文中保留越久,供后文翻译参考\n- 输出格式:重要性数值|翻译结果,不需要任何解释或备注,推测的翻译部分加上括号\n\n前文参考:\n{context}\n\n上一句是:{last}\n\n待翻译内容:\n{text}",
+            "prompt_template": "你是一个为VRChat提供实时翻译的专业同声传译助手\n- 翻译成口语化的中文,保留语气词,前文和上一句无需翻译\n- 原文为语音识别,可能存在断句问题和同/近音词错误,结合上下文推测完整且正确的语句\n- 输出格式:紧凑json,例{\"v\":30,\"t\":\"翻译结果\"},字段v表示该段翻译的重要性,整数取值0~99,越重要的段落会在前文参考中记忆越久,字段t中不需要任何解释或备注,推测的翻译部分加上括号,使用\\n换行\n\n前文参考:\n{context}\n\n上一句是:{last}\n\n待翻译内容:\n{text}",
             "instant_prompt_template": "翻译成中文,不完整的部分使用...代替,只输出翻译结果,不需要任何解释或备注:\n{text}",
             "instant_translate": False  # 是否启用即时翻译
         }
