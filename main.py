@@ -53,6 +53,66 @@ class TranslatorApp:
         
         # 创建GUI
         self.app = QApplication(sys.argv)
+        
+        # 强制应用暗色主题，不依赖系统主题
+        self.app.setStyle("Fusion")  # 使用Fusion样式，跨平台一致
+        # 设置全局暗色主题样式表
+        self.app.setStyleSheet("""
+            QApplication {
+                color: #d4d4d4;
+                background-color: #2b2b2b;
+            }
+            QWidget {
+                color: #d4d4d4;
+                background-color: #2b2b2b;
+            }
+            QMenuBar {
+                background-color: #2b2b2b;
+                color: #d4d4d4;
+            }
+            QMenuBar::item {
+                background-color: transparent;
+            }
+            QMenuBar::item:selected {
+                background-color: #3c3c3c;
+            }
+            QMenu {
+                background-color: #2b2b2b;
+                color: #d4d4d4;
+                border: 1px solid #555;
+            }
+            QMenu::item:selected {
+                background-color: #3c3c3c;
+            }
+            QToolTip {
+                background-color: #1e1e1e;
+                color: #d4d4d4;
+                border: 1px solid #555;
+            }
+            QScrollBar:vertical {
+                background-color: #2b2b2b;
+                width: 12px;
+            }
+            QScrollBar::handle:vertical {
+                background-color: #555;
+                min-height: 20px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background-color: #666;
+            }
+            QScrollBar:horizontal {
+                background-color: #2b2b2b;
+                height: 12px;
+            }
+            QScrollBar::handle:horizontal {
+                background-color: #555;
+                min-width: 20px;
+            }
+            QScrollBar::handle:horizontal:hover {
+                background-color: #666;
+            }
+        """)
+        
         self.window = MainWindow(self.config)
         
         # 连接信号

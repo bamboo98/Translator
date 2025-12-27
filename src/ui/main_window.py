@@ -756,10 +756,11 @@ class MainWindow(QMainWindow):
     
     def _apply_style(self) -> None:
         """应用样式"""
-        # 设置深色主题
+        # 设置深色主题（补充QApplication级别的样式）
         self.setStyleSheet("""
             QMainWindow {
                 background-color: #2b2b2b;
+                color: #d4d4d4;
             }
             QGroupBox {
                 font-weight: bold;
@@ -767,11 +768,14 @@ class MainWindow(QMainWindow):
                 border-radius: 5px;
                 margin-top: 10px;
                 padding-top: 10px;
+                background-color: #2b2b2b;
+                color: #d4d4d4;
             }
             QGroupBox::title {
                 subcontrol-origin: margin;
                 left: 10px;
                 padding: 0 5px;
+                color: #d4d4d4;
             }
             QTextEdit {
                 background-color: #1e1e1e;
@@ -779,6 +783,8 @@ class MainWindow(QMainWindow):
                 border: 1px solid #555;
                 border-radius: 3px;
                 padding: 5px;
+                selection-background-color: #0e639c;
+                selection-color: white;
             }
             QPushButton {
                 background-color: #0e639c;
@@ -798,19 +804,118 @@ class MainWindow(QMainWindow):
                 background-color: #555;
                 color: #888;
             }
-            QComboBox, QLineEdit {
+            QComboBox {
                 background-color: #3c3c3c;
                 color: #d4d4d4;
                 border: 1px solid #555;
                 border-radius: 3px;
                 padding: 5px;
+                selection-background-color: #0e639c;
+                selection-color: white;
+            }
+            QComboBox::drop-down {
+                border: none;
+                background-color: #3c3c3c;
+            }
+            QComboBox::down-arrow {
+                image: none;
+                border-left: 4px solid transparent;
+                border-right: 4px solid transparent;
+                border-top: 4px solid #d4d4d4;
+                margin-right: 5px;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #2b2b2b;
+                color: #d4d4d4;
+                selection-background-color: #0e639c;
+                selection-color: white;
+                border: 1px solid #555;
+            }
+            QLineEdit {
+                background-color: #3c3c3c;
+                color: #d4d4d4;
+                border: 1px solid #555;
+                border-radius: 3px;
+                padding: 5px;
+                selection-background-color: #0e639c;
+                selection-color: white;
             }
             QLabel {
                 color: #d4d4d4;
+                background-color: transparent;
             }
             QStatusBar {
                 background-color: #1e1e1e;
                 color: #d4d4d4;
+                border-top: 1px solid #555;
+            }
+            QProgressBar {
+                background-color: #1e1e1e;
+                border: 1px solid #555;
+                border-radius: 3px;
+                text-align: center;
+                color: #d4d4d4;
+            }
+            QProgressBar::chunk {
+                background-color: #0e639c;
+                border-radius: 2px;
+            }
+            QCheckBox {
+                color: #d4d4d4;
+                background-color: transparent;
+            }
+            QCheckBox::indicator {
+                width: 16px;
+                height: 16px;
+                background-color: #3c3c3c;
+                border: 1px solid #555;
+                border-radius: 3px;
+            }
+            QCheckBox::indicator:checked {
+                background-color: #0e639c;
+                border: 1px solid #0e639c;
+            }
+            QRadioButton {
+                color: #d4d4d4;
+                background-color: transparent;
+            }
+            QRadioButton::indicator {
+                width: 16px;
+                height: 16px;
+                border-radius: 8px;
+                border: 1px solid #555;
+                background-color: #3c3c3c;
+            }
+            QRadioButton::indicator:checked {
+                background-color: #0e639c;
+                border: 1px solid #0e639c;
+            }
+            QSpinBox, QDoubleSpinBox {
+                background-color: #3c3c3c;
+                color: #d4d4d4;
+                border: 1px solid #555;
+                border-radius: 3px;
+                padding: 3px;
+                selection-background-color: #0e639c;
+                selection-color: white;
+            }
+            QSpinBox::up-button, QDoubleSpinBox::up-button {
+                background-color: #555;
+                border: none;
+                border-top-left-radius: 3px;
+                border-top-right-radius: 3px;
+            }
+            QSpinBox::up-button:hover, QDoubleSpinBox::up-button:hover {
+                background-color: #666;
+            }
+            QSpinBox::down-button, QDoubleSpinBox::down-button {
+                background-color: #555;
+                border: none;
+                border-bottom-left-radius: 3px;
+                border-bottom-right-radius: 3px;
+            }
+            QSpinBox::down-button:hover, QDoubleSpinBox::down-button:hover {
+                background-color: #666;
             }
         """)
     
