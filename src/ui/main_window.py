@@ -246,7 +246,7 @@ class MainWindow(QMainWindow):
     
     def _create_audio_settings(self) -> QGroupBox:
         """创建音频设置面板"""
-        group = QGroupBox("音频设置")
+        group = QGroupBox("音频设置(输入Vosk识别模型)")
         layout = QVBoxLayout()
         
         audio_config = self.config.get_audio_config()

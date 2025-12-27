@@ -361,14 +361,117 @@ class TranslatorApp:
     
     def _on_device_changed(self, device_index: int) -> None:
         """设备改变回调"""
+        # 保存旧设备索引（用于错误恢复）
+        old_device_index = self.config.get("audio.device_index")
+        
         # 保存设备选择到配置
         self.config.set("audio.device_index", device_index)
         self.config.save()
         
-        # 如果正在监听，需要重启音频捕获
-        if self.is_listening:
-            print("设备已更改，需要重启监听")
-            # 可以在这里提示用户重启
+        # 记录当前状态
+        was_listening = self.is_listening
+        was_recognizing = self.is_recognizing
+        was_translating = self.is_translating
+        
+        try:
+            # 如果正在监听，先停止
+            if self.is_listening:
+                # 先关闭识别和翻译（如果正在运行）
+                if self.is_recognizing:
+                    self.stop_recognition()
+                if self.is_translating:
+                    self.stop_translation()
+                
+                # 停止音频捕获
+                if self.audio_capture:
+                    self.audio_capture.stop()
+                    self.audio_capture.close()
+                    self.audio_capture = None
+                self.is_listening = False
+                # 停止音频捕获后将音量显示归零
+                self.window.update_volume(0.0)
+            
+            # 重新创建音频捕获对象（使用新的设备索引）
+            audio_config = self.config.get_audio_config()
+            self.audio_capture = AudioCapture(
+                sample_rate=audio_config.get("sample_rate", 16000),
+                channels=audio_config.get("channels", 1),
+                chunk_size=audio_config.get("chunk_size", 1024),
+                format=audio_config.get("format", "int16"),
+                callback=self._on_audio_chunk,
+                volume_callback=self._on_volume_update,
+                device_index=device_index
+            )
+            
+            # 如果之前正在监听，重新启动监听
+            if was_listening:
+                self.audio_capture.start()
+                self.is_listening = True
+                self.window.set_listening_state(True)
+                
+                # 如果之前正在识别，重新启动识别
+                if was_recognizing and self.vosk_engine:
+                    self.vosk_engine.start()
+                    self.is_recognizing = True
+                    self.window.set_recognition_state(True)
+                
+                # 如果之前正在翻译，重新启动翻译
+                if was_translating:
+                    self.context_manager.clear()
+                    self.pending_translate_request = None
+                    self.is_waiting_for_response = False
+                    self.last_translate_time = 0.0
+                    self.is_translating = True
+                    self.window.set_translation_state(True)
+                
+                self.window.status_bar.showMessage("设备已切换，监听已重启", 2000)
+            else:
+                self.window.status_bar.showMessage("设备已切换", 2000)
+                
+        except Exception as e:
+            print(f"切换设备失败: {e}")
+            self.window.show_error("错误", f"切换设备失败: {e}")
+            # 如果切换失败，回滚配置并尝试恢复到之前的状态
+            if old_device_index is not None:
+                self.config.set("audio.device_index", old_device_index)
+                self.config.save()
+                # 更新UI中的设备选择（需要创建临时对象获取设备列表）
+                try:
+                    audio_config = self.config.get_audio_config()
+                    temp_capture = AudioCapture(
+                        sample_rate=audio_config.get("sample_rate", 16000),
+                        channels=audio_config.get("channels", 1),
+                        chunk_size=audio_config.get("chunk_size", 1024),
+                        format=audio_config.get("format", "int16"),
+                        device_index=None
+                    )
+                    devices = temp_capture.get_available_devices()
+                    temp_capture.close()
+                    self.window.update_device_list(devices, old_device_index)
+                except:
+                    pass
+            
+            if was_listening:
+                try:
+                    # 尝试使用旧的设备索引重新创建
+                    if old_device_index is not None:
+                        audio_config = self.config.get_audio_config()
+                        self.audio_capture = AudioCapture(
+                            sample_rate=audio_config.get("sample_rate", 16000),
+                            channels=audio_config.get("channels", 1),
+                            chunk_size=audio_config.get("chunk_size", 1024),
+                            format=audio_config.get("format", "int16"),
+                            callback=self._on_audio_chunk,
+                            volume_callback=self._on_volume_update,
+                            device_index=old_device_index
+                        )
+                        self.audio_capture.start()
+                        self.is_listening = True
+                        self.window.set_listening_state(True)
+                except Exception as restore_error:
+                    print(f"恢复旧设备失败: {restore_error}")
+                    self.is_listening = False
+                    self.window.set_listening_state(False)
     
     def _on_manual_translate(self, text: str) -> None:
         """手动翻译回调"""
@@ -423,6 +526,8 @@ class TranslatorApp:
                 self.audio_capture.stop()
             self.is_listening = False
             self.window.set_listening_state(False)
+            # 关闭监听后将音量显示归零
+            self.window.update_volume(0.0)
             self.window.status_bar.showMessage("监听已关闭", 2000)
         except Exception as e:
             print(f"关闭监听失败: {e}")
