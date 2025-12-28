@@ -1,0 +1,42 @@
+{
+  "audio": {
+    "sample_rate": 16000,
+    "channels": 1,
+    "process_interval_seconds": 2.5,
+    "format": "int16",
+    "device_index": 4,
+    "device_type": "loopback",
+    "loopback_device_index": 46,
+    "volume_threshold": 0.5,
+    "sentence_break_interval": 1.0
+  },
+  "vosk": {
+    "model_path": "models",
+    "language": "zh"
+  },
+  "translation": {
+    "api_provider": "siliconflow",
+    "api_key": "",
+    "api_url": "https://api.siliconflow.cn/v1/chat/completions",
+    "model": "deepseek-ai/DeepSeek-V3",
+    "timeout": 30,
+    "max_tokens": 8000,
+    "temperature": 0.3,
+    "memory_max_count": 6,
+    "memory_time": 300,
+    "prompt_template": "你是一个为VRChat提供实时翻译的专业同声传译助手\n- 翻译成口语化的中文,保留语气词,前文和上一句无需翻译\n- 原文为语音识别,可能存在断句问题和同/近音词错误,结合上下文推测完整且正确的语句\n- 输出格式:紧凑json,例{\"v\":30,\"t\":\"翻译结果\"},字段v表示该段翻译的重要性,整数取值0~99,越重要的段落会在前文参考中记忆越久,字段t中不需要任何解释或备注,推测的翻译部分加上括号,使用\\n换行\n\n前文参考:\n{context}\n\n上一句是:{last}\n\n待翻译内容:\n{text}",
+    "instant_prompt_template": "翻译成中文,不完整的部分使用...代替,只输出翻译结果,不需要任何解释或备注:\n{text}",
+    "instant_translate": false,
+    "use_ai_translation": true,
+    "instant_use_machine_translation": true,
+    "machine_translation": {
+      "provider": "tencent",
+      "tencent_secret_id": "",
+      "tencent_secret_key": "",
+      "tencent_region": "ap-beijing",
+      "target_language": "zh",
+      "project_id": 0,
+      "used_chars": 0
+    }
+  }
+}

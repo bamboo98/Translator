@@ -9,3 +9,4 @@ Pillow>=10.0.0
 pyaudiowpatch>=0.2.12.7
 tencentcloud-sdk-python-common>=3.1.20
 tencentcloud-sdk-python-tmt>=3.0.1478
+scipy>=1.10.0 
