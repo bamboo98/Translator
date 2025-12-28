@@ -4,10 +4,11 @@ Vosk语音识别引擎
 import json
 import os
 from pathlib import Path
-from typing import Optional, Callable, Dict, Any
-from vosk import Model, KaldiRecognizer
+from typing import Optional, Callable, Dict, Any, List, Tuple
+from vosk import Model, KaldiRecognizer, SpkModel, SetLogLevel
 import threading
 import queue
+import numpy as np
 
 class VoskEngine:
     """Vosk语音识别引擎类"""
@@ -16,7 +17,7 @@ class VoskEngine:
                  model_path: str = "models",
                  language: str = "zh",
                  sample_rate: int = 16000,
-                 callback: Optional[Callable[[str, bool], None]] = None):
+                 callback: Optional[Callable[[str, bool, Optional[List[float]], Optional[int], str], None]] = None):
         """
         初始化Vosk识别引擎
         
@@ -24,7 +25,7 @@ class VoskEngine:
             model_path: 模型存放目录
             language: 语言代码（zh, en, ja, ko等）
             sample_rate: 采样率
-            callback: 识别结果回调函数 (text, is_final)
+            callback: 识别结果回调函数 (text, is_final, spk_embedding, speaker_id, feature_hash)
         """
         self.model_path = Path(model_path)
         self.language = language
@@ -32,10 +33,26 @@ class VoskEngine:
         self.callback = callback
         
         self.model: Optional[Model] = None
+        self.spk_model: Optional[SpkModel] = None  # 说话人识别模型
         self.recognizer: Optional[KaldiRecognizer] = None
         self.is_processing = False
         self.audio_queue = queue.Queue()
         self.processing_thread: Optional[threading.Thread] = None
+        
+        # 说话人识别相关
+        self.speaker_profiles: Dict[int, List[float]] = {}  # {speaker_id: embedding}
+        self.speaker_embeddings_history: List[tuple] = []  # [(embedding, text), ...] 存储至少2句话的嵌入
+        self.min_sentences_for_speaker_id = 2  # 至少需要2句话才开始说话人识别
+        self.similarity_threshold = 0.5  # 说话人相似度阈值（降低以提高匹配率）
+        self.next_speaker_id = 1
+        self.speaker_id_enabled = False  # 是否启用说话人识别功能（取决于说话人模型是否加载成功）
+        # 注意：如果speaker_id_enabled=False，所有说话人ID将视为1，但不会显示（因为只有一个说话人）
+        
+        # 设置Vosk日志级别为-1（关闭所有日志）
+        try:
+            SetLogLevel(-1)
+        except:
+            pass
         
         # 加载模型
         self.load_model()
@@ -135,17 +152,56 @@ class VoskEngine:
             return False
         
         try:
-            # 卸载旧模型
+            # 卸载旧模型（确保数据干净）
             if self.recognizer:
                 self.recognizer = None
             if self.model:
                 self.model = None
+            if self.spk_model:
+                self.spk_model = None
             
-            # 加载新模型
-            print(f"正在加载模型: {model_dir}")
+            # 清空说话人识别相关数据
+            self.speaker_profiles.clear()
+            self.speaker_embeddings_history.clear()
+            self.next_speaker_id = 1
+            self.speaker_id_enabled = False  # 默认不启用
+            
+            # 加载语言识别模型
+            print(f"正在加载语言模型: {model_dir}")
             self.model = Model(str(model_dir))
             self.recognizer = KaldiRecognizer(self.model, self.sample_rate)
             self.recognizer.SetWords(True)  # 启用词级时间戳
+            
+            # 加载说话人识别模型（使用SpkModel类，不是Model类）
+            spk_model_path = self.model_path / "vosk-model-spk-0.4"
+            if spk_model_path.exists() and spk_model_path.is_dir():
+                # 检查spk模型必需的文件
+                required_files = ["final.ext.raw", "mean.vec", "transform.mat", "mfcc.conf"]
+                has_all_files = all((spk_model_path / f).exists() for f in required_files)
+                
+                if has_all_files:
+                    print(f"正在加载说话人识别模型: {spk_model_path}")
+                    try:
+                        self.spk_model = SpkModel(str(spk_model_path))
+                        self.recognizer.SetSpkModel(self.spk_model)
+                        self.speaker_id_enabled = True  # 说话人模型加载成功，启用说话人识别
+                        print("说话人识别模型加载成功，说话人识别功能已启用")
+                    except Exception as e:
+                        print(f"加载说话人识别模型失败: {e}")
+                        self.spk_model = None
+                        self.speaker_id_enabled = False
+                        print("说话人识别功能已禁用（模型加载失败）")
+                else:
+                    print(f"警告: 说话人识别模型目录存在但缺少必需文件，说话人识别功能将不可用")
+                    print(f"需要的文件: {', '.join(required_files)}")
+                    self.spk_model = None
+                    self.speaker_id_enabled = False
+                    print("说话人识别功能已禁用（缺少必需文件）")
+            else:
+                print(f"提示: 未找到说话人识别模型 {spk_model_path}，说话人识别功能将不可用")
+                self.spk_model = None
+                self.speaker_id_enabled = False
+                print("说话人识别功能已禁用（模型不存在），所有说话人ID将视为1")
             
             print(f"模型加载成功: {self.language}")
             return True
@@ -153,7 +209,10 @@ class VoskEngine:
         except Exception as e:
             print(f"加载模型失败: {e}")
             self.model = None
+            self.spk_model = None
             self.recognizer = None
+            import traceback
+            traceback.print_exc()
             return False
     
     def start(self) -> None:
@@ -199,6 +258,110 @@ class VoskEngine:
         if self.is_processing and self.recognizer:
             self.audio_queue.put(audio_data)
     
+    def _cosine_similarity(self, vec1: List[float], vec2: List[float]) -> float:
+        """计算两个向量的余弦相似度"""
+        vec1 = np.array(vec1)
+        vec2 = np.array(vec2)
+        dot_product = np.dot(vec1, vec2)
+        norm1 = np.linalg.norm(vec1)
+        norm2 = np.linalg.norm(vec2)
+        if norm1 == 0 or norm2 == 0:
+            return 0.0
+        return dot_product / (norm1 * norm2)
+    
+    def _embedding_to_hash(self, embedding: List[float]) -> str:
+        """
+        将特征向量转换为简短的哈希字符串（用于显示）
+        
+        Args:
+            embedding: 说话人特征向量
+            
+        Returns:
+            特征码字符串（前8个维度的简化表示）
+        """
+        if not embedding or len(embedding) == 0:
+            return ""
+        
+        # 取前8个维度，转换为整数并格式化为字符串
+        # 使用前8个维度的符号和绝对值的前2位数字
+        hash_parts = []
+        for i in range(min(8, len(embedding))):
+            val = embedding[i]
+            # 取符号和绝对值的前2位
+            sign = "+" if val >= 0 else "-"
+            abs_val = abs(val)
+            # 转换为0-99的整数
+            int_val = min(99, int(abs_val * 10))
+            hash_parts.append(f"{sign}{int_val:02d}")
+        
+        return "".join(hash_parts)
+    
+    def _identify_speaker(self, embedding: List[float]) -> Tuple[Optional[int], str]:
+        """
+        识别说话人
+        
+        Args:
+            embedding: 说话人特征向量
+            
+        Returns:
+            (说话人ID, 特征码) 的元组，如果无法识别返回 (None, "")
+        """
+        if not embedding or len(embedding) == 0:
+            return None, ""
+        
+        # 生成特征码
+        feature_hash = self._embedding_to_hash(embedding)
+        
+        # 如果还没有足够的句子，不进行说话人识别
+        if len(self.speaker_embeddings_history) < self.min_sentences_for_speaker_id:
+            return None, feature_hash
+        
+        # 如果还没有说话人档案，创建第一个
+        if len(self.speaker_profiles) == 0:
+            # 第一个说话人
+            speaker_id = self.next_speaker_id
+            self.speaker_profiles[speaker_id] = embedding.copy()
+            self.next_speaker_id += 1
+            return speaker_id, feature_hash
+        
+        # 与已有说话人比较（使用所有历史嵌入的平均值）
+        best_match = None
+        max_similarity = 0.0
+        
+        for speaker_id, profile_embedding in self.speaker_profiles.items():
+            similarity = self._cosine_similarity(embedding, profile_embedding)
+            if similarity > max_similarity:
+                max_similarity = similarity
+                best_match = speaker_id
+        
+        # 如果相似度足够高，认为是同一说话人
+        # 使用更低的阈值，并考虑历史相似度
+        if max_similarity >= self.similarity_threshold:
+            # 更新说话人特征（滑动平均，更倾向于保留历史特征）
+            alpha = 0.1  # 新特征权重较小，更稳定
+            self.speaker_profiles[best_match] = [
+                (1 - alpha) * self.speaker_profiles[best_match][i] + alpha * embedding[i]
+                for i in range(len(embedding))
+            ]
+            return best_match, feature_hash
+        else:
+            # 新说话人（但需要更严格的判断）
+            # 如果相似度太低（<0.3），才认为是新说话人
+            if max_similarity < 0.3:
+                speaker_id = self.next_speaker_id
+                self.speaker_profiles[speaker_id] = embedding.copy()
+                self.next_speaker_id += 1
+                return speaker_id, feature_hash
+            else:
+                # 相似度在0.3-0.5之间，可能是同一说话人但特征有变化
+                # 更新特征但保持ID
+                alpha = 0.15
+                self.speaker_profiles[best_match] = [
+                    (1 - alpha) * self.speaker_profiles[best_match][i] + alpha * embedding[i]
+                    for i in range(len(embedding))
+                ]
+                return best_match, feature_hash
+    
     def _process_audio(self) -> None:
         """音频处理线程"""
         while self.is_processing:
@@ -214,14 +377,41 @@ class VoskEngine:
                     # 最终结果
                     result = json.loads(self.recognizer.Result())
                     text = result.get('text', '').strip()
-                    if text and self.callback:
-                        self.callback(text, True)
+                    spk = result.get('spk', None)  # 说话人特征向量
+                    
+                    if text:
+                        speaker_id = None
+                        feature_hash = ""
+                        
+                        # 如果启用了说话人识别功能且获取到了特征向量，进行说话人识别
+                        if self.speaker_id_enabled and self.spk_model and spk:
+                            # 保存嵌入历史（用于后续识别）
+                            self.speaker_embeddings_history.append((spk, text))
+                            # 只保留最近的嵌入（避免内存增长）
+                            if len(self.speaker_embeddings_history) > 10:
+                                self.speaker_embeddings_history.pop(0)
+                            
+                            # 识别说话人（返回ID和特征码）
+                            speaker_id, feature_hash = self._identify_speaker(spk)
+                        elif not self.speaker_id_enabled:
+                            # 如果说话人识别功能未启用，所有说话人ID视为1
+                            # 但不添加到speaker_profiles，这样就不会显示说话人ID（因为只有一个说话人）
+                            speaker_id = 1
+                        
+                        if self.callback:
+                            self.callback(text, True, spk, speaker_id, feature_hash)
                 else:
                     # 部分结果
                     result = json.loads(self.recognizer.PartialResult())
                     text = result.get('partial', '').strip()
+                    spk = result.get('spk', None)
+                    
                     if text and self.callback:
-                        self.callback(text, False)
+                        # 部分结果不进行说话人识别，但可以生成特征码用于显示
+                        feature_hash = ""
+                        if spk:
+                            feature_hash = self._embedding_to_hash(spk)
+                        self.callback(text, False, spk, None, feature_hash)
                         
             except queue.Empty:
                 continue

@@ -1,10 +1,10 @@
 """
 翻译API客户端模块
-支持硅基流动等在线翻译API
+支持硅基流动等在线翻译API和腾讯云机器翻译
 """
 import httpx
 import asyncio
-from typing import Optional, Dict, Any, Callable, List
+from typing import Optional, Dict, Any, Callable, List, Tuple
 import json
 from enum import Enum
 
@@ -652,4 +652,126 @@ class TranslationClient:
                 except:
                     pass
             self.client = None
+    
+    async def translate_tencent_async(self, text: str, source_lang: str = "auto", target_lang: str = "zh", 
+                                      secret_id: str = "", secret_key: str = "", region: str = "ap-beijing",
+                                      project_id: int = 0) -> Tuple[Optional[str], Optional[int], Optional[str]]:
+        """
+        使用腾讯云机器翻译API进行翻译（异步）
+        
+        Args:
+            text: 待翻译文本
+            source_lang: 源语言代码（auto表示自动检测）
+            target_lang: 目标语言代码（zh=中文, zh-TW=繁体中文, en=英文, ja=日文等）
+            secret_id: 腾讯云SecretId
+            secret_key: 腾讯云SecretKey
+            region: 腾讯云区域
+            project_id: 项目ID
+            
+        Returns:
+            (翻译结果, 已消耗字符数, 错误信息) 的元组
+            如果成功，返回 (翻译结果, 字符数, None)
+            如果失败，返回 (None, None, 错误信息)
+        """
+        if not text or not text.strip():
+            return None, None, "文本为空"
+        
+        if not secret_id or not secret_key:
+            return None, None, "腾讯云API密钥未设置"
+        
+        try:
+            from tencentcloud.common import credential
+            from tencentcloud.common.profile.client_profile import ClientProfile
+            from tencentcloud.common.profile.http_profile import HttpProfile
+            from tencentcloud.tmt.v20180321 import tmt_client, models
+        except ImportError:
+            return None, None, "腾讯云SDK未安装，请运行: pip install tencentcloud-sdk-python-tmt"
+        
+        try:
+            # 创建凭证对象
+            cred = credential.Credential(secret_id, secret_key)
+            
+            # 实例化http选项
+            httpProfile = HttpProfile()
+            httpProfile.endpoint = "tmt.tencentcloudapi.com"
+            
+            # 实例化client选项
+            clientProfile = ClientProfile()
+            clientProfile.httpProfile = httpProfile
+            
+            # 实例化要请求产品的client对象
+            client = tmt_client.TmtClient(cred, region, clientProfile)
+            
+            # 实例化请求对象
+            req = models.TextTranslateRequest()
+            req.SourceText = text
+            req.Source = source_lang
+            req.Target = target_lang
+            req.ProjectId = project_id
+            
+            # 调用接口（注意：腾讯云SDK是同步的，需要在异步环境中使用线程池）
+            import concurrent.futures
+            loop = asyncio.get_event_loop()
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                resp = await loop.run_in_executor(executor, client.TextTranslate, req)
+            
+            # 解析响应
+            if hasattr(resp, 'TargetText'):
+                used_chars = getattr(resp, 'UsedAmount', 0) if hasattr(resp, 'UsedAmount') else len(text.encode('utf-8'))
+                return resp.TargetText, used_chars, None
+            else:
+                return None, None, "API响应格式错误"
+                
+        except Exception as e:
+            error_msg = self._parse_tencent_error(e)
+            return None, None, error_msg
+    
+    def _parse_tencent_error(self, error: Exception) -> str:
+        """
+        解析腾讯云API错误，返回中文描述
+        
+        Args:
+            error: 异常对象
+            
+        Returns:
+            中文错误描述
+        """
+        error_str = str(error)
+        
+        # 公共错误码映射
+        common_errors = {
+            "AuthFailure": "签名验证失败，请检查SecretId和SecretKey是否正确",
+            "AuthFailure.SecretIdNotFound": "SecretId不存在",
+            "AuthFailure.SignatureExpire": "签名已过期",
+            "AuthFailure.SignatureFailure": "签名错误",
+            "InvalidParameter": "参数错误",
+            "InvalidParameterValue": "参数值错误",
+            "MissingParameter": "缺少必需参数",
+            "RequestLimitExceeded": "请求频率超过限制",
+            "ResourceInsufficient": "资源不足",
+            "ResourceNotFound": "资源不存在",
+            "ResourceUnavailable": "资源不可用",
+            "UnauthorizedOperation": "未授权操作",
+            "UnknownParameter": "未知参数",
+            "UnsupportedOperation": "不支持的操作",
+        }
+        
+        # 接口特定错误码
+        api_errors = {
+            "InvalidParameterValue.SourceTextEmpty": "待翻译文本为空",
+            "InvalidParameterValue.SourceTextTooLong": "待翻译文本过长",
+            "InvalidParameterValue.SourceLanguageNotSupported": "不支持的源语言",
+            "InvalidParameterValue.TargetLanguageNotSupported": "不支持的目标语言",
+            "InvalidParameterValue.SourceTargetSame": "源语言和目标语言相同",
+            "LimitExceeded": "请求频率超过限制",
+            "ResourceInsufficient": "资源不足",
+        }
+        
+        # 尝试匹配错误码
+        for error_code, description in {**common_errors, **api_errors}.items():
+            if error_code in error_str:
+                return f"{description} ({error_code})"
+        
+        # 如果没有匹配到，返回原始错误信息
+        return f"腾讯云API错误: {error_str}"
 

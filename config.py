@@ -13,12 +13,13 @@ class Config:
         "audio": {
             "sample_rate": 16000,
             "channels": 1,
-            "process_interval_seconds": 3.0,  # 处理间隔（秒），默认3秒
+            "process_interval_seconds": 2.5,  # 处理间隔（秒），默认3秒
             "format": "int16",
             "device_index": None,  # None表示自动查找CABLE设备
             "device_type": "input",  # "input" 或 "loopback"，表示使用输入设备还是桌面音频
             "loopback_device_index": None,  # 桌面音频设备索引
-            "volume_threshold": 1.0  # 音量阈值（0-100），低于此值不传递给识别模型
+            "volume_threshold": 0.5,  # 音量阈值（0-100），低于此值不传递给识别模型
+            "sentence_break_interval": 1.0  # 断句间隔（秒），静音超过此时间后立即发送数据
         },
         "vosk": {
             "model_path": "models",
@@ -36,7 +37,18 @@ class Config:
             "memory_time": 300,  # 记忆时间（秒），默认5分钟
             "prompt_template": "你是一个为VRChat提供实时翻译的专业同声传译助手\n- 翻译成口语化的中文,保留语气词,前文和上一句无需翻译\n- 原文为语音识别,可能存在断句问题和同/近音词错误,结合上下文推测完整且正确的语句\n- 输出格式:紧凑json,例{\"v\":30,\"t\":\"翻译结果\"},字段v表示该段翻译的重要性,整数取值0~99,越重要的段落会在前文参考中记忆越久,字段t中不需要任何解释或备注,推测的翻译部分加上括号,使用\\n换行\n\n前文参考:\n{context}\n\n上一句是:{last}\n\n待翻译内容:\n{text}",
             "instant_prompt_template": "翻译成中文,不完整的部分使用...代替,只输出翻译结果,不需要任何解释或备注:\n{text}",
-            "instant_translate": False  # 是否启用即时翻译
+            "instant_translate": False,  # 是否启用即时翻译
+            "use_ai_translation": True,  # 是否使用AI翻译（大模型）
+            "instant_use_machine_translation": True,  # 即时翻译是否使用机器翻译
+            "machine_translation": {
+                "provider": "tencent",  # 机器翻译提供商
+                "tencent_secret_id": "",  # 腾讯云SecretId
+                "tencent_secret_key": "",  # 腾讯云SecretKey
+                "tencent_region": "ap-beijing",  # 腾讯云区域
+                "target_language": "zh",  # 目标语言：zh/zh-TW/en/ja
+                "project_id": 0,  # 项目ID
+                "used_chars": 0  # 已消耗字符数
+            }
         }
     }
     

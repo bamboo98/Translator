@@ -17,7 +17,8 @@ class LoopbackAudioCapture:
                  callback: Optional[Callable[[bytes], None]] = None,
                  volume_callback: Optional[Callable[[float], None]] = None,
                  device_index: Optional[int] = None,
-                 volume_threshold: float = 1.0):
+                 volume_threshold: float = 1.0,
+                 sentence_break_interval: float = 2.0):
         """
         初始化音频捕获
         
@@ -30,6 +31,7 @@ class LoopbackAudioCapture:
             volume_callback: 音量回调函数（接收音量值0-100）
             device_index: 设备索引，如果为None则使用默认WASAPI环回设备
             volume_threshold: 音量阈值（0-100），低于此值不传递给识别模型
+            sentence_break_interval: 断句间隔（秒），静音超过此时间后立即发送数据
         """
         self.sample_rate = sample_rate  # 目标采样率（用于Vosk）
         self.channels = channels
@@ -38,6 +40,7 @@ class LoopbackAudioCapture:
         self.callback = callback
         self.volume_callback = volume_callback
         self.volume_threshold = volume_threshold
+        self.sentence_break_interval = sentence_break_interval
         
         self.pa = None
         self.audio_stream = None
@@ -54,6 +57,12 @@ class LoopbackAudioCapture:
         self.frames = []  # 累积的音频帧
         self.frame_count = 0
         self.frame_volumes = []  # 累积的音量值
+        
+        # 断句相关
+        self.is_speaking = False  # 是否正在说话
+        self.silence_start_time = None  # 静音开始时间（时间戳）
+        import time
+        self.time = time  # 保存time模块引用
         
         # 查找设备
         if device_index is None:
@@ -119,6 +128,60 @@ class LoopbackAudioCapture:
         self.frames.append(audio_data)
         self.frame_count += 1
         self.frame_volumes.append(volume)
+        
+        # 断句逻辑：根据音量阈值判断是否在说话
+        current_time = self.time.time()
+        if volume > self.volume_threshold:
+            # 音量大于阈值，正在说话
+            self.is_speaking = True
+            self.silence_start_time = None  # 清空静音统计时长
+        else:
+            # 音量小于阈值，累计静音统计时长
+            if self.silence_start_time is None:
+                self.silence_start_time = current_time
+            silence_duration = current_time - self.silence_start_time
+            
+            # 如果静音时长大于断句间隔，并且正在说话，立即发送数据
+            if silence_duration >= self.sentence_break_interval and self.is_speaking:
+                self.is_speaking = False
+                # 立即发送累积的数据（无视process_interval条件）
+                if self.frames:
+                    audio_bytes = b''.join(self.frames)
+                    
+                    # 计算累积块的平均音量
+                    avg_volume = 0.0
+                    if self.frame_volumes:
+                        avg_volume = sum(self.frame_volumes) / len(self.frame_volumes)
+                    
+                    # 清空累积的帧和音量
+                    self.frames = []
+                    self.frame_count = 0
+                    self.frame_volumes = []
+                    
+                    # 如果实际采样率与目标采样率不同，进行重采样
+                    if self.actual_sample_rate != self.sample_rate:
+                        try:
+                            # 转换为numpy数组
+                            audio_array = np.frombuffer(audio_bytes, dtype=np.int16)
+                            # 重采样到目标采样率
+                            ratio = self.sample_rate / self.actual_sample_rate
+                            original_length = len(audio_array)
+                            target_length = int(original_length * ratio)
+                            indices = np.linspace(0, original_length - 1, target_length)
+                            resampled_array = np.interp(indices, np.arange(original_length), audio_array)
+                            # 转换回int16并转为字节
+                            audio_bytes = resampled_array.astype(np.int16).tobytes()
+                        except Exception as e:
+                            print(f"重采样失败: {e}，使用原始音频")
+                    
+                    # 调用回调函数处理累积的音频块
+                    if self.callback:
+                        try:
+                            self.callback(audio_bytes)
+                        except Exception as e:
+                            print(f"音频回调处理错误: {e}")
+                    
+                    return (None, pyaudiowpatch.paContinue)
         
         # 达到处理间隔时处理累积的音频块
         if len(self.frames) >= self.process_interval:
@@ -218,6 +281,9 @@ class LoopbackAudioCapture:
             self.frames = []
             self.frame_count = 0
             self.frame_volumes = []
+            # 重置断句相关状态
+            self.is_speaking = False
+            self.silence_start_time = None
             
             # 启动流
             self.audio_stream.start_stream()
@@ -253,6 +319,9 @@ class LoopbackAudioCapture:
         self.frames = []
         self.frame_count = 0
         self.frame_volumes = []
+        # 重置断句相关状态
+        self.is_speaking = False
+        self.silence_start_time = None
         
         print("音频捕获已停止")
     

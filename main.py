@@ -42,7 +42,7 @@ class TranslatorApp:
         self.current_text = ""
         
         # 翻译请求状态管理（事件驱动模式）
-        self.pending_translate_request: Optional[dict] = None  # 等待中的请求：{"text": str, "type": "instant"/"full", "context_prompt": str, "last_text": str}
+        self.pending_translate_request: Optional[dict] = None  # 等待中的请求：{"text": str, "type": "instant"/"full", "context_prompt": str, "last_text": str, "speaker_id": Optional[int]}
         self.is_waiting_for_response = False  # 是否正在等待上一个请求返回
         self.last_translate_time = 0.0  # 上次翻译完成时间
         self.translate_thread: Optional[threading.Thread] = None  # 常驻翻译工作线程
@@ -148,6 +148,8 @@ class TranslatorApp:
         self.window.status_message_signal.connect(self.window.show_status_message)
         self.window.apply_settings_signal.connect(self._on_apply_settings)
         self.window.clear_texts_signal.connect(self._on_clear_texts)
+        self.window.update_used_chars_signal.connect(self._on_used_chars_updated)
+        self.window.translation_status_updated_signal.connect(self.window.update_translation_status)
     
     def _init_modules(self) -> None:
         """初始化各个模块"""
@@ -159,6 +161,7 @@ class TranslatorApp:
             loopback_device_index = audio_config.get("loopback_device_index")
             process_interval_seconds = audio_config.get("process_interval_seconds", 3.0)
             volume_threshold = audio_config.get("volume_threshold", 1.0)
+            sentence_break_interval = audio_config.get("sentence_break_interval", 2.0)
             
             # 获取输入设备列表
             input_devices = []
@@ -168,7 +171,8 @@ class TranslatorApp:
                     channels=audio_config.get("channels", 1),
                     process_interval_seconds=process_interval_seconds,
                     format=audio_config.get("format", "int16"),
-                    device_index=None  # 不指定设备，只用于获取列表
+                    device_index=None,  # 不指定设备，只用于获取列表
+                    sentence_break_interval=sentence_break_interval
                 )
                 input_devices = temp_capture.get_available_devices()
                 temp_capture.close()
@@ -183,7 +187,8 @@ class TranslatorApp:
                     channels=audio_config.get("channels", 1),
                     process_interval_seconds=process_interval_seconds,
                     format=audio_config.get("format", "int16"),
-                    device_index=None
+                    device_index=None,
+                    sentence_break_interval=sentence_break_interval
                 )
                 loopback_devices = temp_loopback.get_available_devices()
                 temp_loopback.close()
@@ -209,7 +214,8 @@ class TranslatorApp:
                     callback=self._on_audio_chunk,
                     volume_callback=self._on_volume_update,
                     device_index=device_index,
-                    volume_threshold=volume_threshold
+                    volume_threshold=volume_threshold,
+                    sentence_break_interval=sentence_break_interval
                 )
             elif device_type == "loopback" and loopback_device_index is not None:
                 self.loopback_capture = LoopbackAudioCapture(
@@ -220,7 +226,8 @@ class TranslatorApp:
                     callback=self._on_audio_chunk,
                     volume_callback=self._on_volume_update,
                     device_index=loopback_device_index,
-                    volume_threshold=volume_threshold
+                    volume_threshold=volume_threshold,
+                    sentence_break_interval=sentence_break_interval
                 )
             
             # 不立即初始化Vosk引擎，等用户点击加载模型按钮
@@ -265,7 +272,7 @@ class TranslatorApp:
         # 直接使用信号emit（信号是线程安全的）
         self.window.volume_updated_signal.emit(volume)
     
-    def _on_recognition_result(self, text: str, is_final: bool) -> None:
+    def _on_recognition_result(self, text: str, is_final: bool, spk_embedding: Optional[list] = None, speaker_id: Optional[int] = None, feature_hash: str = "") -> None:
         """识别结果回调（可能在非主线程中调用）"""
         if not text or not text.strip():
             return
@@ -281,8 +288,17 @@ class TranslatorApp:
             if text_stripped == "the":
                 return  # 忽略无效的 'the' 识别结果
         
+        # 检查是否有多个说话人（至少2个），只有多个说话人才显示标识
+        display_speaker_id = None
+        display_feature_hash = ""
+        if is_final and speaker_id is not None:
+            if hasattr(self.vosk_engine, 'speaker_profiles') and len(self.vosk_engine.speaker_profiles) > 1:
+                display_speaker_id = speaker_id
+                display_feature_hash = feature_hash
+        
         # 直接使用信号emit（信号是线程安全的）
-        self.window.recognition_text_updated_signal.emit(text, is_final)
+        # 传递原始文本、说话人ID和特征码，让UI层决定如何显示
+        self.window.recognition_text_updated_signal.emit(text, is_final, display_speaker_id, display_feature_hash)
         
         if self.is_translating:
             if is_final:
@@ -290,7 +306,7 @@ class TranslatorApp:
                 self.current_text = text
                 context_prompt = self.context_manager.get_context()
                 last_text = self.context_manager.get_last_text()
-                self._request_translate(text, "full", context_prompt, last_text)
+                self._request_translate(text, "full", context_prompt, last_text, display_speaker_id)
             else:
                 # 部分结果：检查是否启用即时翻译
                 trans_config = self.config.get_translation_config()
@@ -299,9 +315,9 @@ class TranslatorApp:
                     text_utf8_len = len(text.encode('utf-8'))
                     if text_utf8_len > 8:
                         # 即时翻译请求
-                        self._request_translate(text, "instant", "", "")
+                        self._request_translate(text, "instant", "", "", display_speaker_id)
     
-    def _request_translate(self, text: str, request_type: str, context_prompt: str = "", last_text: str = "") -> None:
+    def _request_translate(self, text: str, request_type: str, context_prompt: str = "", last_text: str = "", speaker_id: Optional[int] = None) -> None:
         """
         请求翻译（事件驱动）
         
@@ -310,6 +326,7 @@ class TranslatorApp:
             request_type: "instant" 或 "full"
             context_prompt: 上下文提示词（仅完整翻译使用）
             last_text: 上一句话（仅完整翻译使用）
+            speaker_id: 说话人ID（如果有多个说话人）
         """
         # 新的覆盖规则：
         # 1. 请求完整翻译时：
@@ -325,11 +342,13 @@ class TranslatorApp:
                 # 如果当前是完整翻译，合并text到末尾（添加\n）
                 existing_text = self.pending_translate_request.get("text", "")
                 merged_text = existing_text + "\n" + text if existing_text else text
+                # 合并时，使用最新的speaker_id（如果提供）
                 self.pending_translate_request = {
                     "text": merged_text,
                     "type": "full",
                     "context_prompt": context_prompt,  # 使用新的context_prompt
-                    "last_text": last_text  # 使用新的last_text
+                    "last_text": last_text,  # 使用新的last_text
+                    "speaker_id": speaker_id if speaker_id is not None else self.pending_translate_request.get("speaker_id")
                 }
             else:
                 # 如果当前是即时翻译或没有请求，直接覆盖
@@ -337,7 +356,8 @@ class TranslatorApp:
                     "text": text,
                     "type": "full",
                     "context_prompt": context_prompt,
-                    "last_text": last_text
+                    "last_text": last_text,
+                    "speaker_id": speaker_id
                 }
         elif request_type == "instant":
             # 即时翻译请求
@@ -349,7 +369,8 @@ class TranslatorApp:
                 "text": text,
                 "type": "instant",
                 "context_prompt": "",
-                "last_text": ""
+                "last_text": "",
+                "speaker_id": speaker_id
             }
         
         # 如果有待处理的请求且没有正在等待响应，通知工作线程
@@ -469,79 +490,174 @@ class TranslatorApp:
                         # print(f"准备请求翻译: {request_data}")
                         
                         try:
+                            trans_config = self.config.get_translation_config()
+                            use_ai = trans_config.get("use_ai_translation", True)
+                            machine_config = trans_config.get("machine_translation", {})
+                            
                             if request["type"] == "full":
-                                # 完整翻译 - 使用异步方法
-                                start_time = time.time()
-                                result = loop.run_until_complete(
-                                    self.translation_client.translate_async(
-                                        request["text"],
-                                        request["context_prompt"],
-                                        request["last_text"]
+                                # 完整翻译
+                                if use_ai:
+                                    # 使用AI翻译
+                                    start_time = time.time()
+                                    result = loop.run_until_complete(
+                                        self.translation_client.translate_async(
+                                            request["text"],
+                                            request["context_prompt"],
+                                            request["last_text"]
+                                        )
                                     )
-                                )
-                                total_time = time.time() - start_time
-                                # print(f"[完整翻译] run_until_complete总耗时: {total_time:.3f}秒")
-                                # 记录耗时到统计列表
-                                self.translate_times.append(total_time)
-                                if len(self.translate_times) > 20:
-                                    self.translate_times.pop(0)
-                                # 更新UI显示（使用信号确保线程安全）
-                                self.window.translation_status_updated_signal.emit(self.is_translating, self.is_waiting_for_response, self.translate_times.copy())
-                                if result:
-                                    # 解析翻译结果，提取权重和翻译文本
-                                    weight, translation_text = self._parse_translation_result(result)
-                                    
-                                    # 将原文和权重保存到上下文管理器
-                                    self.context_manager.add_context(request["text"], weight=weight)
-                                    
-                                    # 发送翻译结果到UI
-                                    self.window.translation_text_updated_signal.emit(translation_text)
+                                    total_time = time.time() - start_time
+                                    # 记录耗时到统计列表
+                                    self.translate_times.append(total_time)
+                                    if len(self.translate_times) > 20:
+                                        self.translate_times.pop(0)
+                                    # 更新UI显示（使用信号确保线程安全）
+                                    self.window.translation_status_updated_signal.emit(self.is_translating, self.is_waiting_for_response, self.translate_times.copy())
+                                    if result:
+                                        # 解析翻译结果，提取权重和翻译文本
+                                        weight, translation_text = self._parse_translation_result(result)
+                                        
+                                        # 将原文和权重保存到上下文管理器
+                                        self.context_manager.add_context(request["text"], weight=weight)
+                                        
+                                        # 发送翻译结果到UI（传递说话人ID）
+                                        request_speaker_id = request.get("speaker_id")
+                                        self.window.translation_text_updated_signal.emit(translation_text, request_speaker_id)
+                                    else:
+                                        print(f"翻译失败: 返回结果为空")
+                                        print(f"请求数据: {json.dumps(request_data, ensure_ascii=False, indent=2)}")
+                                        self.window.status_message_signal.emit("翻译失败: 返回结果为空", 5000)
                                 else:
-                                    print(f"翻译失败: 返回结果为空")
-                                    print(f"请求数据: {json.dumps(request_data, ensure_ascii=False, indent=2)}")
-                                    self.window.status_message_signal.emit("翻译失败: 返回结果为空", 5000)
+                                    # 使用机器翻译
+                                    start_time = time.time()
+                                    result, used_chars, error = loop.run_until_complete(
+                                        self.translation_client.translate_tencent_async(
+                                            request["text"],
+                                            source_lang="auto",
+                                            target_lang=machine_config.get("target_language", "zh"),
+                                            secret_id=machine_config.get("tencent_secret_id", ""),
+                                            secret_key=machine_config.get("tencent_secret_key", ""),
+                                            region=machine_config.get("tencent_region", "ap-beijing"),
+                                            project_id=machine_config.get("project_id", 0)
+                                        )
+                                    )
+                                    total_time = time.time() - start_time
+                                    # 记录耗时到统计列表
+                                    self.translate_times.append(total_time)
+                                    if len(self.translate_times) > 20:
+                                        self.translate_times.pop(0)
+                                    # 更新UI显示（使用信号确保线程安全）
+                                    self.window.translation_status_updated_signal.emit(self.is_translating, self.is_waiting_for_response, self.translate_times.copy())
+                                    
+                                    if error:
+                                        print(f"机器翻译失败: {error}")
+                                        self.window.status_message_signal.emit(f"机器翻译失败: {error}", 5000)
+                                    elif result:
+                                        # 更新字符数统计
+                                        if used_chars:
+                                            current_chars = machine_config.get("used_chars", 0)
+                                            new_chars = current_chars + used_chars
+                                            self.config.set("translation.machine_translation.used_chars", new_chars)
+                                            self.config.save()
+                                            # 更新UI显示
+                                            self.window.update_used_chars_signal.emit(new_chars)
+                                        
+                                        # 机器翻译结果
+                                        translation_text = result
+                                        
+                                        # 将原文和权重保存到上下文管理器（权重为100，默认权重）
+                                        self.context_manager.add_context(request["text"], weight=100)
+                                        
+                                        # 发送翻译结果到UI（传递说话人ID）
+                                        request_speaker_id = request.get("speaker_id")
+                                        self.window.translation_text_updated_signal.emit(translation_text, request_speaker_id)
+                                    else:
+                                        print(f"机器翻译失败: 返回结果为空")
+                                        self.window.status_message_signal.emit("机器翻译失败: 返回结果为空", 5000)
                             else:
                                 # 即时翻译
-                                trans_config = self.config.get_translation_config()
-                                instant_prompt_template = trans_config.get("instant_prompt_template", "")
+                                instant_use_machine = trans_config.get("instant_use_machine_translation", True) if use_ai else True
                                 
-                                if not instant_prompt_template:
-                                    instant_prompt_template = trans_config.get("prompt_template", "")
-                                
-                                # 构建即时翻译提示词
-                                if instant_prompt_template:
-                                    prompt = instant_prompt_template.replace("{text}", request["text"])
-                                    prompt = prompt.replace("{context}", "当前新对话")
-                                    prompt = prompt.replace("{last}", "")
-                                else:
-                                    prompt = f"翻译以下文本为中文：{request['text']}"
-                                
-                                # 记录即时翻译的提示词
-                                request_data["prompt"] = prompt
-                                
-                                # 即时翻译 - 使用异步方法
-                                start_time = time.time()
-                                result = loop.run_until_complete(
-                                    self.translation_client.translate_async_with_prompt(request["text"], prompt)
-                                )
-                                total_time = time.time() - start_time
-                                # print(f"[即时翻译] run_until_complete总耗时: {total_time:.3f}秒")
-                                # 记录耗时到统计列表
-                                self.translate_times.append(total_time)
-                                if len(self.translate_times) > 20:
-                                    self.translate_times.pop(0)
-                                # 更新UI显示（使用信号确保线程安全）
-                                self.window.translation_status_updated_signal.emit(self.is_translating, self.is_waiting_for_response, self.translate_times.copy())
-                                
-                                if result:
-                                    # 解析翻译结果，提取翻译文本（即时翻译不需要权重）
-                                    _, translation_text = self._parse_translation_result(result)
+                                if instant_use_machine:
+                                    # 使用机器翻译
+                                    start_time = time.time()
+                                    result, used_chars, error = loop.run_until_complete(
+                                        self.translation_client.translate_tencent_async(
+                                            request["text"],
+                                            source_lang="auto",
+                                            target_lang=machine_config.get("target_language", "zh"),
+                                            secret_id=machine_config.get("tencent_secret_id", ""),
+                                            secret_key=machine_config.get("tencent_secret_key", ""),
+                                            region=machine_config.get("tencent_region", "ap-beijing"),
+                                            project_id=machine_config.get("project_id", 0)
+                                        )
+                                    )
+                                    total_time = time.time() - start_time
+                                    # 记录耗时到统计列表
+                                    self.translate_times.append(total_time)
+                                    if len(self.translate_times) > 20:
+                                        self.translate_times.pop(0)
+                                    # 更新UI显示（使用信号确保线程安全）
+                                    self.window.translation_status_updated_signal.emit(self.is_translating, self.is_waiting_for_response, self.translate_times.copy())
                                     
-                                    # 即时翻译只更新最近一次翻译，不保存历史，不保存上下文
-                                    self.window.translation_latest_text_updated_signal.emit(translation_text)
+                                    if error:
+                                        print(f"即时机器翻译失败: {error}")
+                                    elif result:
+                                        # 更新字符数统计
+                                        if used_chars:
+                                            current_chars = machine_config.get("used_chars", 0)
+                                            new_chars = current_chars + used_chars
+                                            self.config.set("translation.machine_translation.used_chars", new_chars)
+                                            self.config.save()
+                                            # 更新UI显示
+                                            self.window.update_used_chars_signal.emit(new_chars)
+                                        
+                                        # 即时翻译只更新最近一次翻译，不保存历史，不保存上下文（传递说话人ID）
+                                        request_speaker_id = request.get("speaker_id")
+                                        self.window.translation_latest_text_updated_signal.emit(result, request_speaker_id)
+                                    else:
+                                        print(f"即时机器翻译失败: 返回结果为空")
                                 else:
-                                    print(f"即时翻译失败: 返回结果为空")
-                                    print(f"请求数据: {json.dumps(request_data, ensure_ascii=False, indent=2)}")
+                                    # 使用AI翻译
+                                    instant_prompt_template = trans_config.get("instant_prompt_template", "")
+                                    
+                                    if not instant_prompt_template:
+                                        instant_prompt_template = trans_config.get("prompt_template", "")
+                                    
+                                    # 构建即时翻译提示词
+                                    if instant_prompt_template:
+                                        prompt = instant_prompt_template.replace("{text}", request["text"])
+                                        prompt = prompt.replace("{context}", "当前新对话")
+                                        prompt = prompt.replace("{last}", "")
+                                    else:
+                                        prompt = f"翻译以下文本为中文：{request['text']}"
+                                    
+                                    # 记录即时翻译的提示词
+                                    request_data["prompt"] = prompt
+                                    
+                                    # 即时翻译 - 使用异步方法
+                                    start_time = time.time()
+                                    result = loop.run_until_complete(
+                                        self.translation_client.translate_async_with_prompt(request["text"], prompt)
+                                    )
+                                    total_time = time.time() - start_time
+                                    # 记录耗时到统计列表
+                                    self.translate_times.append(total_time)
+                                    if len(self.translate_times) > 20:
+                                        self.translate_times.pop(0)
+                                    # 更新UI显示（使用信号确保线程安全）
+                                    self.window.translation_status_updated_signal.emit(self.is_translating, self.is_waiting_for_response, self.translate_times.copy())
+                                    
+                                    if result:
+                                        # 解析翻译结果，提取翻译文本（即时翻译不需要权重）
+                                        _, translation_text = self._parse_translation_result(result)
+                                        
+                                        # 即时翻译只更新最近一次翻译，不保存历史，不保存上下文（传递说话人ID）
+                                        request_speaker_id = request.get("speaker_id")
+                                        self.window.translation_latest_text_updated_signal.emit(translation_text, request_speaker_id)
+                                    else:
+                                        print(f"即时翻译失败: 返回结果为空")
+                                        print(f"请求数据: {json.dumps(request_data, ensure_ascii=False, indent=2)}")
                         except Exception as e:
                             print(f"翻译错误: {e}")
                             print(f"请求数据: {json.dumps(request_data, ensure_ascii=False, indent=2)}")
@@ -606,6 +722,11 @@ class TranslatorApp:
         device_type_name = "输入设备" if device_type == "input" else "桌面音频"
         self.window.status_bar.showMessage(f"已切换到{device_type_name}，将在下次开启监听时生效", 2000)
     
+    def _on_used_chars_updated(self, chars: int) -> None:
+        """更新已消耗字符数"""
+        if hasattr(self.window, '_update_used_chars_display'):
+            self.window._update_used_chars_display(chars)
+    
     def _on_volume_threshold_changed(self, threshold: float) -> None:
         """音量阈值改变回调（实时生效）"""
         # 保存配置
@@ -654,6 +775,7 @@ class TranslatorApp:
             loopback_device_index = audio_config.get("loopback_device_index")
             process_interval_seconds = audio_config.get("process_interval_seconds", 3.0)
             volume_threshold = audio_config.get("volume_threshold", 1.0)
+            sentence_break_interval = audio_config.get("sentence_break_interval", 2.0)
             
             # 根据设备类型创建或使用对应的捕获对象
             if device_type == "input":
@@ -673,7 +795,8 @@ class TranslatorApp:
                         callback=self._on_audio_chunk,
                         volume_callback=self._on_volume_update,
                         device_index=device_index,
-                        volume_threshold=volume_threshold
+                        volume_threshold=volume_threshold,
+                        sentence_break_interval=sentence_break_interval
                     )
                 
                 self.audio_capture.start()
@@ -694,7 +817,8 @@ class TranslatorApp:
                         callback=self._on_audio_chunk,
                         volume_callback=self._on_volume_update,
                         device_index=loopback_device_index,
-                        volume_threshold=volume_threshold
+                        volume_threshold=volume_threshold,
+                        sentence_break_interval=sentence_break_interval
                     )
                 
                 self.loopback_capture.start()
@@ -830,6 +954,35 @@ class TranslatorApp:
         except Exception as e:
             print(f"关闭识别失败: {e}")
     
+    def _check_translation_config(self) -> tuple[bool, str]:
+        """
+        检查翻译配置是否完整
+        
+        Returns:
+            (是否配置完整, 错误信息)
+        """
+        trans_config = self.config.get_translation_config()
+        use_ai = trans_config.get("use_ai_translation", True)
+        machine_config = trans_config.get("machine_translation", {})
+        
+        if use_ai:
+            # 使用AI翻译，需要检查大模型API密钥
+            if not self.translation_client or not self.translation_client.api_key:
+                return False, "AI翻译需要设置API密钥"
+            
+            # 检查是否启用即时翻译使用机翻
+            instant_use_machine = trans_config.get("instant_use_machine_translation", True)
+            if instant_use_machine:
+                # 即时翻译使用机翻，需要检查机翻配置
+                if not machine_config.get("tencent_secret_id") or not machine_config.get("tencent_secret_key"):
+                    return False, "即时翻译使用机翻需要设置腾讯云SecretId和SecretKey"
+        else:
+            # 不使用AI翻译，完整翻译和即时翻译都用机翻
+            if not machine_config.get("tencent_secret_id") or not machine_config.get("tencent_secret_key"):
+                return False, "机器翻译需要设置腾讯云SecretId和SecretKey"
+        
+        return True, ""
+    
     def start_translation(self) -> None:
         """开启翻译"""
         if self.is_translating:
@@ -839,10 +992,10 @@ class TranslatorApp:
             self.window.show_error("错误", "请先开启识别")
             return
         
-        # 检查API密钥
-        trans_config = self.config.get_translation_config()
-        if not trans_config.get("api_key"):
-            self.window.show_error("配置错误", "请先设置API密钥")
+        # 检查翻译配置
+        config_ok, error_msg = self._check_translation_config()
+        if not config_ok:
+            self.window.show_error("配置错误", error_msg)
             return
         
         try:
@@ -894,6 +1047,7 @@ class TranslatorApp:
         try:
             audio_config = self.config.get_audio_config()
             process_interval_seconds = audio_config.get("process_interval_seconds", 3.0)
+            sentence_break_interval = audio_config.get("sentence_break_interval", 2.0)
             
             # 获取输入设备列表
             input_devices = []
@@ -906,7 +1060,8 @@ class TranslatorApp:
                         channels=audio_config.get("channels", 1),
                         process_interval_seconds=process_interval_seconds,
                         format=audio_config.get("format", "int16"),
-                        device_index=None  # 不初始化设备，只用于获取列表
+                        device_index=None,  # 不初始化设备，只用于获取列表
+                        sentence_break_interval=sentence_break_interval
                     )
                     input_devices = temp_capture.get_available_devices()
                     temp_capture.close()
@@ -924,7 +1079,8 @@ class TranslatorApp:
                         channels=audio_config.get("channels", 1),
                         process_interval_seconds=process_interval_seconds,
                         format=audio_config.get("format", "int16"),
-                        device_index=None
+                        device_index=None,
+                        sentence_break_interval=sentence_break_interval
                     )
                     loopback_devices = temp_loopback.get_available_devices()
                     temp_loopback.close()
@@ -971,6 +1127,8 @@ class TranslatorApp:
             #     self.config.set("audio.channels", self.window.audio_channels_spin.value())
             if hasattr(self.window, 'audio_process_interval_spin'):
                 self.config.set("audio.process_interval_seconds", self.window.audio_process_interval_spin.value())
+            if hasattr(self.window, 'audio_sentence_break_interval_spin'):
+                self.config.set("audio.sentence_break_interval", self.window.audio_sentence_break_interval_spin.value())
             if hasattr(self.window, 'audio_format_combo'):
                 self.config.set("audio.format", self.window.audio_format_combo.currentText())
             
@@ -1009,6 +1167,21 @@ class TranslatorApp:
             # 保存即时翻译设置
             if hasattr(self.window, 'instant_translate_checkbox'):
                 self.config.set("translation.instant_translate", self.window.instant_translate_checkbox.isChecked())
+            
+            # 保存机器翻译设置
+            if hasattr(self.window, 'tencent_secret_id_edit'):
+                self.config.set("translation.machine_translation.tencent_secret_id", self.window.tencent_secret_id_edit.text())
+            if hasattr(self.window, 'tencent_secret_key_edit'):
+                self.config.set("translation.machine_translation.tencent_secret_key", self.window.tencent_secret_key_edit.text())
+            if hasattr(self.window, 'tencent_region_combo'):
+                region_value = self.window.tencent_region_combo.currentData()
+                if region_value:
+                    self.config.set("translation.machine_translation.tencent_region", region_value)
+            if hasattr(self.window, 'tencent_target_lang_combo'):
+                self.config.set("translation.machine_translation.target_language", self.window.tencent_target_lang_combo.currentText())
+            if hasattr(self.window, 'tencent_project_id_spin'):
+                self.config.set("translation.machine_translation.project_id", self.window.tencent_project_id_spin.value())
+            # 注意：used_chars 不需要从UI保存，它由程序运行时自动更新
             
             # 保存配置
             self.config.save()

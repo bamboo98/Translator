@@ -8,7 +8,7 @@ from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QDoubleSpinBox, QCheckBox)
 from PyQt6.QtCore import Qt, pyqtSignal, QThread, QTimer
 from PyQt6.QtGui import QFont, QColor, QPalette
-from typing import Optional, Callable
+from typing import Optional, Callable, Dict, Any
 import sys
 
 class MainWindow(QMainWindow):
@@ -30,11 +30,12 @@ class MainWindow(QMainWindow):
     refresh_devices_signal = pyqtSignal()  # 刷新设备列表
     volume_threshold_changed_signal = pyqtSignal(float)  # 音量阈值改变信号
     volume_updated_signal = pyqtSignal(float)  # 音量更新信号
-    recognition_text_updated_signal = pyqtSignal(str, bool)  # 识别文本更新信号 (text, is_final)
-    translation_text_updated_signal = pyqtSignal(str)  # 翻译文本更新信号（完整句子，更新最近和历史）
-    translation_latest_text_updated_signal = pyqtSignal(str)  # 即时翻译文本更新信号（只更新最近）
+    recognition_text_updated_signal = pyqtSignal(str, bool, object, str)  # 识别文本更新信号 (text, is_final, speaker_id, feature_hash)
+    translation_text_updated_signal = pyqtSignal(str, object)  # 翻译文本更新信号（完整句子，更新最近和历史）(text, speaker_id)
+    translation_latest_text_updated_signal = pyqtSignal(str, object)  # 即时翻译文本更新信号（只更新最近）(text, speaker_id)
     instant_translate_changed_signal = pyqtSignal(bool)  # 即时翻译设置改变信号
     translation_status_updated_signal = pyqtSignal(bool, bool, list)  # 翻译状态更新信号 (is_translating, is_waiting, translate_times)
+    update_used_chars_signal = pyqtSignal(int)  # 更新已消耗字符数信号
     manual_translate_signal = pyqtSignal(str)  # 手动翻译信号
     status_message_signal = pyqtSignal(str, int)  # 状态栏消息信号 (message, timeout_ms)
     apply_settings_signal = pyqtSignal()  # 应用设置信号（会重启程序）
@@ -57,6 +58,8 @@ class MainWindow(QMainWindow):
         
         # 连接翻译状态更新信号
         self.translation_status_updated_signal.connect(self.update_translation_status)
+        # 连接更新字符数信号
+        self.update_used_chars_signal.connect(self._on_used_chars_updated)
         
         self.init_ui()
         self.apply_config()
@@ -293,6 +296,18 @@ class MainWindow(QMainWindow):
         interval_layout.addStretch()
         layout.addLayout(interval_layout)
         
+        # 断句间隔（秒）
+        break_interval_layout = QHBoxLayout()
+        break_interval_layout.addWidget(QLabel("断句间隔 (秒):"))
+        self.audio_sentence_break_interval_spin = QDoubleSpinBox()
+        self.audio_sentence_break_interval_spin.setRange(0.5, 10.0)
+        self.audio_sentence_break_interval_spin.setSingleStep(0.5)
+        self.audio_sentence_break_interval_spin.setValue(audio_config.get("sentence_break_interval", 2.0))
+        self.audio_sentence_break_interval_spin.setDecimals(1)
+        break_interval_layout.addWidget(self.audio_sentence_break_interval_spin)
+        break_interval_layout.addStretch()
+        layout.addLayout(break_interval_layout)
+        
         # 音频格式
         format_layout = QHBoxLayout()
         format_layout.addWidget(QLabel("音频格式:"))
@@ -333,99 +348,224 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout()
         
         trans_config = self.config.get_translation_config()
+        machine_config = trans_config.get("machine_translation", {})
         
-        # API提供商
-        provider_layout = QHBoxLayout()
-        provider_layout.addWidget(QLabel("API提供商:"))
+        # 使用分割器实现上下布局
+        splitter = QSplitter(Qt.Orientation.Vertical)
+        
+        # 上半部分：AI翻译设置
+        ai_group = QGroupBox("AI翻译")
+        ai_layout = QVBoxLayout(ai_group)
+        
+        # API提供商和API密钥在同一行
+        provider_key_layout = QHBoxLayout()
+        provider_key_layout.addWidget(QLabel("API提供商:"))
         self.trans_provider_combo = QComboBox()
         self.trans_provider_combo.addItems(["siliconflow", "openai", "custom"])
         current_provider = trans_config.get("api_provider", "siliconflow")
         index = self.trans_provider_combo.findText(current_provider)
         if index >= 0:
             self.trans_provider_combo.setCurrentIndex(index)
-        provider_layout.addWidget(self.trans_provider_combo)
-        provider_layout.addStretch()
-        layout.addLayout(provider_layout)
-        
-        # API密钥
-        key_layout = QHBoxLayout()
-        key_layout.addWidget(QLabel("API密钥:"))
+        provider_key_layout.addWidget(self.trans_provider_combo)
+        provider_key_layout.addWidget(QLabel("API密钥:"))
         self.trans_api_key_edit = QLineEdit()
         self.trans_api_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
         self.trans_api_key_edit.setText(trans_config.get("api_key", ""))
-        key_layout.addWidget(self.trans_api_key_edit)
-        layout.addLayout(key_layout)
+        provider_key_layout.addWidget(self.trans_api_key_edit)
+        provider_key_layout.addStretch()
+        ai_layout.addLayout(provider_key_layout)
         
-        # API地址
-        url_layout = QHBoxLayout()
-        url_layout.addWidget(QLabel("API地址:"))
+        # API地址和模型名称在同一行
+        url_model_layout = QHBoxLayout()
+        url_model_layout.addWidget(QLabel("API地址:"))
         self.trans_api_url_edit = QLineEdit()
         self.trans_api_url_edit.setText(trans_config.get("api_url", ""))
-        url_layout.addWidget(self.trans_api_url_edit)
-        layout.addLayout(url_layout)
-        
-        # 模型名称
-        model_layout = QHBoxLayout()
-        model_layout.addWidget(QLabel("模型名称:"))
+        url_model_layout.addWidget(self.trans_api_url_edit)
+        url_model_layout.addWidget(QLabel("模型名称:"))
         self.trans_model_edit = QLineEdit()
         self.trans_model_edit.setText(trans_config.get("model", "deepseek-ai/DeepSeek-V3"))
-        model_layout.addWidget(self.trans_model_edit)
-        layout.addLayout(model_layout)
+        url_model_layout.addWidget(self.trans_model_edit)
+        url_model_layout.addStretch()
+        ai_layout.addLayout(url_model_layout)
         
-        # 超时时间
-        timeout_layout = QHBoxLayout()
-        timeout_layout.addWidget(QLabel("超时时间 (秒):"))
+        # 超时时间、Max Tokens、Temperature在同一行
+        params_layout = QHBoxLayout()
+        params_layout.addWidget(QLabel("超时时间 (秒):"))
         self.trans_timeout_spin = QSpinBox()
         self.trans_timeout_spin.setRange(5, 300)
         self.trans_timeout_spin.setValue(trans_config.get("timeout", 30))
-        timeout_layout.addWidget(self.trans_timeout_spin)
-        timeout_layout.addStretch()
-        layout.addLayout(timeout_layout)
-        
-        # Max Tokens
-        max_tokens_layout = QHBoxLayout()
-        max_tokens_layout.addWidget(QLabel("最大Token数:"))
+        self.trans_timeout_spin.setMaximumWidth(80)
+        params_layout.addWidget(self.trans_timeout_spin)
+        params_layout.addWidget(QLabel("最大Token数:"))
         self.trans_max_tokens_spin = QSpinBox()
         self.trans_max_tokens_spin.setRange(100, 32000)
         self.trans_max_tokens_spin.setValue(trans_config.get("max_tokens", 8000))
-        max_tokens_layout.addWidget(self.trans_max_tokens_spin)
-        max_tokens_layout.addStretch()
-        layout.addLayout(max_tokens_layout)
-        
-        # Temperature
-        temperature_layout = QHBoxLayout()
-        temperature_layout.addWidget(QLabel("Temperature:"))
+        self.trans_max_tokens_spin.setMaximumWidth(100)
+        params_layout.addWidget(self.trans_max_tokens_spin)
+        params_layout.addWidget(QLabel("Temperature:"))
         self.trans_temperature_spin = QDoubleSpinBox()
         self.trans_temperature_spin.setRange(0.0, 2.0)
         self.trans_temperature_spin.setSingleStep(0.1)
         self.trans_temperature_spin.setDecimals(1)
         self.trans_temperature_spin.setValue(trans_config.get("temperature", 0.3))
-        temperature_layout.addWidget(self.trans_temperature_spin)
-        temperature_layout.addStretch()
-        layout.addLayout(temperature_layout)
+        self.trans_temperature_spin.setMaximumWidth(80)
+        params_layout.addWidget(self.trans_temperature_spin)
+        params_layout.addStretch()
+        ai_layout.addLayout(params_layout)
         
-        # 记忆最大条数
-        memory_count_layout = QHBoxLayout()
-        memory_count_layout.addWidget(QLabel("记忆最大条数:"))
+        # 记忆最大条数和记忆时间在同一行
+        memory_layout = QHBoxLayout()
+        memory_layout.addWidget(QLabel("记忆最大条数:"))
         self.trans_memory_count_spin = QSpinBox()
         self.trans_memory_count_spin.setRange(1, 100)
         self.trans_memory_count_spin.setValue(trans_config.get("memory_max_count", 10))
-        memory_count_layout.addWidget(self.trans_memory_count_spin)
-        memory_count_layout.addStretch()
-        layout.addLayout(memory_count_layout)
-        
-        # 记忆时间
-        memory_time_layout = QHBoxLayout()
-        memory_time_layout.addWidget(QLabel("记忆时间 (秒):"))
+        self.trans_memory_count_spin.setMaximumWidth(80)
+        memory_layout.addWidget(self.trans_memory_count_spin)
+        memory_layout.addWidget(QLabel("记忆时间 (秒):"))
         self.trans_memory_time_spin = QSpinBox()
         self.trans_memory_time_spin.setRange(10, 3600)
         self.trans_memory_time_spin.setValue(trans_config.get("memory_time", 300))
-        memory_time_layout.addWidget(self.trans_memory_time_spin)
-        memory_time_layout.addStretch()
-        layout.addLayout(memory_time_layout)
+        self.trans_memory_time_spin.setMaximumWidth(100)
+        memory_layout.addWidget(self.trans_memory_time_spin)
+        memory_layout.addStretch()
+        ai_layout.addLayout(memory_layout)
         
+        ai_group.setLayout(ai_layout)
+        
+        # 下半部分：机器翻译设置
+        machine_group = QGroupBox("机器翻译")
+        machine_layout = QVBoxLayout(machine_group)
+        
+        # 提供商（只读，显示腾讯云）
+        provider_layout = QHBoxLayout()
+        provider_layout.addWidget(QLabel("提供商:"))
+        self.machine_provider_label = QLabel("腾讯云")
+        self.machine_provider_label.setStyleSheet("color: #888; font-style: italic;")
+        provider_layout.addWidget(self.machine_provider_label)
+        provider_layout.addStretch()
+        machine_layout.addLayout(provider_layout)
+        
+        # SecretId和SecretKey在同一行
+        secret_layout = QHBoxLayout()
+        secret_layout.addWidget(QLabel("SecretId:"))
+        self.tencent_secret_id_edit = QLineEdit()
+        self.tencent_secret_id_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.tencent_secret_id_edit.setText(machine_config.get("tencent_secret_id", ""))
+        secret_layout.addWidget(self.tencent_secret_id_edit)
+        secret_layout.addWidget(QLabel("SecretKey:"))
+        self.tencent_secret_key_edit = QLineEdit()
+        self.tencent_secret_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.tencent_secret_key_edit.setText(machine_config.get("tencent_secret_key", ""))
+        secret_layout.addWidget(self.tencent_secret_key_edit)
+        secret_layout.addStretch()
+        machine_layout.addLayout(secret_layout)
+        
+        # 服务器区域和目标语言在同一行
+        region_lang_layout = QHBoxLayout()
+        region_lang_layout.addWidget(QLabel("服务器区域:"))
+        self.tencent_region_combo = QComboBox()
+        regions = [
+            ("亚太东南（曼谷）", "ap-bangkok"),
+            ("华北地区（北京）", "ap-beijing"),
+            ("西南地区（成都）", "ap-chengdu"),
+            ("西南地区（重庆）", "ap-chongqing"),
+            ("华南地区（广州）", "ap-guangzhou"),
+            ("港澳台地区（中国香港）", "ap-hongkong"),
+            ("亚太东北（首尔）", "ap-seoul"),
+            ("华东地区（上海）", "ap-shanghai"),
+            ("华东地区（上海金融）", "ap-shanghai-fsi"),
+            ("华南地区（深圳金融）", "ap-shenzhen-fsi"),
+            ("亚太东南（新加坡）", "ap-singapore"),
+            ("亚太东北（东京）", "ap-tokyo"),
+            ("欧洲地区（法兰克福）", "eu-frankfurt"),
+            ("美国东部（弗吉尼亚）", "na-ashburn"),
+            ("美国西部（硅谷）", "na-siliconvalley")
+        ]
+        for name, value in regions:
+            self.tencent_region_combo.addItem(name, value)
+        current_region = machine_config.get("tencent_region", "ap-beijing")
+        for i in range(self.tencent_region_combo.count()):
+            if self.tencent_region_combo.itemData(i) == current_region:
+                self.tencent_region_combo.setCurrentIndex(i)
+                break
+        region_lang_layout.addWidget(self.tencent_region_combo)
+        region_lang_layout.addWidget(QLabel("目标语言:"))
+        self.tencent_target_lang_combo = QComboBox()
+        self.tencent_target_lang_combo.addItems(["zh", "zh-TW", "en", "ja"])
+        current_target_lang = machine_config.get("target_language", "zh")
+        index = self.tencent_target_lang_combo.findText(current_target_lang)
+        if index >= 0:
+            self.tencent_target_lang_combo.setCurrentIndex(index)
+        region_lang_layout.addWidget(self.tencent_target_lang_combo)
+        region_lang_layout.addStretch()
+        machine_layout.addLayout(region_lang_layout)
+        
+        # ProjectId和已消耗字符数在同一行
+        project_chars_layout = QHBoxLayout()
+        project_chars_layout.addWidget(QLabel("ProjectId:"))
+        self.tencent_project_id_spin = QSpinBox()
+        self.tencent_project_id_spin.setRange(0, 999999)
+        self.tencent_project_id_spin.setValue(machine_config.get("project_id", 0))
+        self.tencent_project_id_spin.setMaximumWidth(100)
+        project_chars_layout.addWidget(self.tencent_project_id_spin)
+        project_chars_layout.addWidget(QLabel("(一般无需填写)"))
+        used_chars = machine_config.get("used_chars", 0)
+        self.tencent_used_chars_label = QLabel()
+        self._update_used_chars_display(used_chars)
+        project_chars_layout.addWidget(QLabel("已消耗字符数:"))
+        project_chars_layout.addWidget(self.tencent_used_chars_label)
+        self.clear_chars_btn = QPushButton("清空计数")
+        self.clear_chars_btn.setMaximumWidth(80)
+        self.clear_chars_btn.clicked.connect(self._on_clear_chars_clicked)
+        project_chars_layout.addWidget(self.clear_chars_btn)
+        project_chars_layout.addStretch()
+        machine_layout.addLayout(project_chars_layout)
+        
+        machine_group.setLayout(machine_layout)
+        
+        splitter.addWidget(ai_group)
+        splitter.addWidget(machine_group)
+        
+        # 设置高度比例
+        splitter.setStretchFactor(0, 2)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([400, 200])
+        
+        layout.addWidget(splitter)
         group.setLayout(layout)
         return group
+    
+    def _update_used_chars_display(self, chars: int) -> None:
+        """更新已消耗字符数显示"""
+        if chars >= 1000000:
+            # 超过1M，显示为X.XXm
+            display = f"{chars / 1000000:.2f}m".rstrip('0').rstrip('.')
+        elif chars >= 1000:
+            # 超过1K，显示为X.XXk
+            display = f"{chars / 1000:.2f}k".rstrip('0').rstrip('.')
+        else:
+            display = str(chars)
+        self.tencent_used_chars_label.setText(display)
+        self.tencent_used_chars_label.setStyleSheet("color: #4caf50; font-weight: bold;")
+    
+    def _on_used_chars_updated(self, chars: int) -> None:
+        """更新已消耗字符数（通过信号调用）"""
+        self._update_used_chars_display(chars)
+    
+    def _on_clear_chars_clicked(self) -> None:
+        """清空字符计数按钮点击事件"""
+        reply = QMessageBox.question(
+            self,
+            "确认",
+            "确定要清空已消耗字符数计数吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self.config.set("translation.machine_translation.used_chars", 0)
+            self.config.save()
+            self._update_used_chars_display(0)
+            self.status_message_signal.emit("已清空字符计数", 2000)
     
     def _on_apply_settings_clicked(self) -> None:
         """应用设置按钮点击事件"""
@@ -684,13 +824,24 @@ class MainWindow(QMainWindow):
         control_layout.addStretch()
         layout.addLayout(control_layout)
         
-        # 第二行：即时翻译勾选框
+        # 第二行：即时翻译、AI翻译、即时翻译使用机翻勾选框
         instant_layout = QHBoxLayout()
         trans_config = self.config.get_translation_config()
         self.instant_translate_checkbox = QCheckBox("即时翻译")
         self.instant_translate_checkbox.setChecked(trans_config.get("instant_translate", False))
         self.instant_translate_checkbox.stateChanged.connect(self._on_instant_translate_changed)
         instant_layout.addWidget(self.instant_translate_checkbox)
+        
+        self.use_ai_translation_checkbox = QCheckBox("AI翻译")
+        self.use_ai_translation_checkbox.setChecked(trans_config.get("use_ai_translation", True))
+        self.use_ai_translation_checkbox.stateChanged.connect(self._on_use_ai_translation_changed)
+        instant_layout.addWidget(self.use_ai_translation_checkbox)
+        
+        self.instant_use_machine_translation_checkbox = QCheckBox("即时翻译使用机翻")
+        self.instant_use_machine_translation_checkbox.setChecked(trans_config.get("instant_use_machine_translation", True))
+        self.instant_use_machine_translation_checkbox.stateChanged.connect(self._on_instant_use_machine_translation_changed)
+        instant_layout.addWidget(self.instant_use_machine_translation_checkbox)
+        
         instant_layout.addStretch()
         layout.addLayout(instant_layout)
         
@@ -996,6 +1147,18 @@ class MainWindow(QMainWindow):
         # 发送信号通知主程序配置已更新
         self.instant_translate_changed_signal.emit(is_checked)
     
+    def _on_use_ai_translation_changed(self, state: int) -> None:
+        """AI翻译勾选框状态改变事件"""
+        is_checked = (state == 2)
+        self.config.set("translation.use_ai_translation", is_checked)
+        self.config.save()
+    
+    def _on_instant_use_machine_translation_changed(self, state: int) -> None:
+        """即时翻译使用机翻勾选框状态改变事件"""
+        is_checked = (state == 2)
+        self.config.set("translation.instant_use_machine_translation", is_checked)
+        self.config.save()
+    
     def show_status_message(self, message: str, timeout: int = 2000) -> None:
         """显示状态栏消息"""
         self.status_bar.showMessage(message, timeout)
@@ -1129,20 +1292,27 @@ class MainWindow(QMainWindow):
         else:
             self.loopback_device_radio.setChecked(True)
     
-    def update_recognition_text(self, text: str, is_final: bool = False) -> None:
+    def update_recognition_text(self, text: str, is_final: bool = False, speaker_id: Optional[int] = None, feature_hash: str = "") -> None:
         """
         更新识别文本（倒序显示，最新在上）
         
         Args:
             text: 识别文本
             is_final: 是否为最终结果
+            speaker_id: 说话人ID（如果有多个说话人）
+            feature_hash: 特征码字符串（已废弃，不再显示）
         """
         from datetime import datetime
         
         if is_final:
             # 最终结果：插入到顶部（倒序）
             current_time = datetime.now().strftime("%H:%M")
-            timestamped_text = f"[{current_time}] {text}"
+            
+            # 如果有说话人ID，在时间戳后添加标识
+            if speaker_id is not None:
+                timestamped_text = f"[{current_time}]({speaker_id}) {text}"
+            else:
+                timestamped_text = f"[{current_time}] {text}"
             
             current_text = self.recognition_text.toPlainText()
             # 保存当前滚动条位置（顶部应该是0）
@@ -1168,29 +1338,54 @@ class MainWindow(QMainWindow):
                 # 检查第一行是否有时间戳，如果有则保留时间戳
                 first_line = lines[0]
                 if first_line.startswith('[') and ']' in first_line:
-                    # 提取时间戳部分
+                    # 提取时间戳部分（可能包含说话人标识）
                     time_end = first_line.find(']')
-                    timestamp = first_line[:time_end + 1]
-                    lines[0] = f"{timestamp} {text}"
+                    # 检查是否有说话人标识
+                    if time_end + 1 < len(first_line) and first_line[time_end + 1:time_end + 2] == '(':
+                        # 有说话人标识，提取到')'为止
+                        speaker_end = first_line.find(')', time_end + 1)
+                        if speaker_end > 0:
+                            timestamp = first_line[:speaker_end + 1]
+                            lines[0] = f"{timestamp} {text}"
+                        else:
+                            timestamp = first_line[:time_end + 1]
+                            if speaker_id is not None:
+                                lines[0] = f"{timestamp}({speaker_id}) {text}"
+                            else:
+                                lines[0] = f"{timestamp} {text}"
+                    else:
+                        # 没有说话人标识
+                        timestamp = first_line[:time_end + 1]
+                        if speaker_id is not None:
+                            lines[0] = f"{timestamp}({speaker_id}) {text}"
+                        else:
+                            lines[0] = f"{timestamp} {text}"
                 else:
                     # 没有时间戳，添加新的时间戳
                     current_time = datetime.now().strftime("%H:%M")
-                    lines[0] = f"[{current_time}] {text}"
+                    if speaker_id is not None:
+                        lines[0] = f"[{current_time}]({speaker_id}) {text}"
+                    else:
+                        lines[0] = f"[{current_time}] {text}"
             else:
                 # 没有内容，创建新行
                 current_time = datetime.now().strftime("%H:%M")
-                lines = [f"[{current_time}] {text}"]
+                if speaker_id is not None:
+                    lines = [f"[{current_time}]({speaker_id}) {text}"]
+                else:
+                    lines = [f"[{current_time}] {text}"]
             
             self.recognition_text.setPlainText('\n'.join(lines))
             # 保持滚动条位置在顶部（0）
             self.recognition_text.verticalScrollBar().setValue(0)
     
-    def update_translation_text(self, text: str) -> None:
+    def update_translation_text(self, text: str, speaker_id: Optional[int] = None) -> None:
         """
         更新翻译文本（完整句子，更新最近和历史，倒序显示，最新在上）
         
         Args:
             text: 翻译文本
+            speaker_id: 说话人ID（如果有多个说话人）
         """
         import re
         from datetime import datetime
@@ -1207,7 +1402,11 @@ class MainWindow(QMainWindow):
         
         # 更新翻译历史（插入到顶部，倒序）
         current_time = datetime.now().strftime("%H:%M")
-        timestamped_text = f"[{current_time}] {cleaned_text}"
+        # 如果有说话人ID，在时间戳后添加标识
+        if speaker_id is not None:
+            timestamped_text = f"[{current_time}]({speaker_id}) {cleaned_text}"
+        else:
+            timestamped_text = f"[{current_time}] {cleaned_text}"
         
         current_history = self.translation_history_text.toPlainText()
         # 保存当前滚动条位置（顶部应该是0）
@@ -1222,12 +1421,13 @@ class MainWindow(QMainWindow):
         # 保持滚动条位置在顶部（0）
         self.translation_history_text.verticalScrollBar().setValue(0)
     
-    def update_translation_latest_text_only(self, text: str) -> None:
+    def update_translation_latest_text_only(self, text: str, speaker_id: Optional[int] = None) -> None:
         """
         只更新最近一次翻译文本（即时翻译用，不更新历史）
         
         Args:
             text: 翻译文本
+            speaker_id: 说话人ID（如果有多个说话人）
         """
         import re
         
@@ -1238,8 +1438,14 @@ class MainWindow(QMainWindow):
             # 移除权重前缀，只保留翻译结果
             cleaned_text = text[weight_match.end():].strip()
         
+        # 如果有说话人ID，在文本前添加标识（用于显示）
+        if speaker_id is not None:
+            display_text = f"({speaker_id}) {cleaned_text}"
+        else:
+            display_text = cleaned_text
+        
         # 只更新最近一次翻译，不更新历史
-        self.translation_latest_text.setText(cleaned_text)
+        self.translation_latest_text.setText(display_text)
     
     def clear_all_texts(self) -> None:
         """清空所有文本显示"""
