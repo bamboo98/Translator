@@ -65,6 +65,9 @@ class AudioCapture:
         import time
         self.time = time  # 保存time模块引用
         
+        # ffmpeg 重采样器（延迟初始化，在 start() 中根据实际采样率创建）
+        self.resampler = None
+        
         # 查找CABLE设备
         if device_index is None:
             self.device_index = self._find_cable_device()
@@ -284,11 +287,12 @@ class AudioCapture:
                     from src.audio.processor import AudioProcessor
                     # 转换为numpy数组
                     audio_array = AudioProcessor.bytes_to_numpy(audio_bytes, self.format)
-                    # 重采样到目标采样率
+                    # 使用 ffmpeg 重采样（如果可用）或回退到简单插值
                     resampled_array = AudioProcessor.resample(
                         audio_array, 
                         self.actual_sample_rate, 
-                        self.sample_rate
+                        self.sample_rate,
+                        resampler=self.resampler
                     )
                     # 转换回字节
                     audio_bytes = AudioProcessor.numpy_to_bytes(resampled_array, self.format)
@@ -438,6 +442,24 @@ class AudioCapture:
             # 如果实际采样率与目标采样率不同，提示需要重采样
             if self.actual_sample_rate != self.sample_rate:
                 print(f"提示: 设备使用{self.actual_sample_rate}Hz采样率（目标{self.sample_rate}Hz），将自动重采样")
+                # 创建 ffmpeg 重采样器
+                try:
+                    from src.audio.processor import FFmpegResampler
+                    format_map = {"int16": "s16le", "int32": "s32le", "float32": "flt"}
+                    ffmpeg_format = format_map.get(self.format, "s16le")
+                    self.resampler = FFmpegResampler(
+                        original_rate=self.actual_sample_rate,
+                        target_rate=self.sample_rate,
+                        format=ffmpeg_format,
+                        channels=self.channels
+                    )
+                    if self.resampler.enabled:
+                        print(f"已启用 ffmpeg 高质量重采样 ({self.actual_sample_rate}Hz -> {self.sample_rate}Hz)")
+                except Exception as e:
+                    print(f"创建 ffmpeg 重采样器失败: {e}，将使用简单插值重采样")
+                    self.resampler = None
+            else:
+                self.resampler = None
             
             # 重置累积帧和音量
             self.frames = []
@@ -483,6 +505,14 @@ class AudioCapture:
         self.is_speaking = False
         self.silence_start_time = None
         
+        # 关闭 ffmpeg 重采样器
+        if self.resampler:
+            try:
+                self.resampler.close()
+            except:
+                pass
+            self.resampler = None
+        
         print("音频捕获已停止")
     
     def read(self, timeout: Optional[float] = None) -> Optional[bytes]:
@@ -503,6 +533,13 @@ class AudioCapture:
     def close(self) -> None:
         """关闭音频捕获并释放资源"""
         self.stop()
+        # 确保关闭重采样器
+        if self.resampler:
+            try:
+                self.resampler.close()
+            except:
+                pass
+            self.resampler = None
         if self.audio:
             try:
                 self.audio.terminate()

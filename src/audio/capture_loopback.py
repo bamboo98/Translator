@@ -64,6 +64,10 @@ class LoopbackAudioCapture:
         import time
         self.time = time  # 保存time模块引用
         
+        # 高质量重采样器（延迟初始化，在 start() 中根据实际采样率创建）
+        # 2025-12-29: 弃用ffmpeg，改用scipy高质量重采样
+        self.resampler = None
+        
         # 查找设备
         if device_index is None:
             self.device_index = None  # 将在start()中使用默认WASAPI环回设备
@@ -76,13 +80,26 @@ class LoopbackAudioCapture:
         try:
             if self.pa is None:
                 self.pa = pyaudiowpatch.PyAudio()
+            
+            # 2025-12-29: 获取系统默认输出设备的loopback设备索引
+            default_loopback_index = None
+            try:
+                default_loopback_info = self.pa.get_default_wasapi_loopback()
+                default_loopback_index = default_loopback_info.get("index")
+            except Exception as e:
+                print(f"获取默认loopback设备失败: {e}")
+            
             for device in self.pa.get_loopback_device_info_generator():
+                device_index = device["index"]
+                # 2025-12-29: 标记默认设备（系统默认输出设备的loopback）
+                is_default = (device_index == default_loopback_index) if default_loopback_index is not None else False
                 devices.append({
-                    'index': device["index"],
+                    'index': device_index,
                     'name': device["name"],
                     'maxInputChannels': device.get("maxInputChannels", 0),
                     'defaultSampleRate': device.get("defaultSampleRate", 44100),
-                    'isCABLE': False  # 环回设备不是CABLE
+                    'isCABLE': False,  # 环回设备不是CABLE
+                    'isDefault': is_default  # 2025-12-29: 标记是否为默认设备
                 })
         except Exception as e:
             print(f"枚举环回设备失败: {e}")
@@ -119,9 +136,11 @@ class LoopbackAudioCapture:
         if self.volume_callback:
             self.volume_callback(volume)
         
-        # 转换为 int16 格式（用于累积和识别）
+        # 2025-12-29-2: 转换为 int16 格式（用于累积和识别）
         # float32 范围是 -1.0 到 1.0，需要缩放到 int16 范围
-        samples_int16 = (samples * 32767).astype(np.int16)
+        # 使用 np.clip 防止溢出，确保值在 [-1.0, 1.0] 范围内
+        samples_clipped = np.clip(samples, -1.0, 1.0)
+        samples_int16 = (samples_clipped * 32767).astype(np.int16)
         audio_data = samples_int16.tobytes()
         
         # 累积音频帧和音量
@@ -153,33 +172,59 @@ class LoopbackAudioCapture:
                     if self.frame_volumes:
                         avg_volume = sum(self.frame_volumes) / len(self.frame_volumes)
                     
+                    # 2025-12-29: 调试输出 - 音量检查
+                    print(f"[DEBUG 2025-12-29] 断句触发 - 平均音量: {avg_volume:.2f}%, 阈值: {self.volume_threshold:.2f}%, 原始音频长度: {len(audio_bytes)} 字节")
+                    
                     # 清空累积的帧和音量
                     self.frames = []
                     self.frame_count = 0
                     self.frame_volumes = []
                     
-                    # 如果实际采样率与目标采样率不同，进行重采样
+                    # 2025-12-29: 如果实际采样率与目标采样率不同，进行高质量重采样
                     if self.actual_sample_rate != self.sample_rate:
                         try:
+                            from src.audio.processor import AudioProcessor
                             # 转换为numpy数组
-                            audio_array = np.frombuffer(audio_bytes, dtype=np.int16)
-                            # 重采样到目标采样率
-                            ratio = self.sample_rate / self.actual_sample_rate
+                            audio_array = AudioProcessor.bytes_to_numpy(audio_bytes, "int16")
                             original_length = len(audio_array)
-                            target_length = int(original_length * ratio)
-                            indices = np.linspace(0, original_length - 1, target_length)
-                            resampled_array = np.interp(indices, np.arange(original_length), audio_array)
-                            # 转换回int16并转为字节
-                            audio_bytes = resampled_array.astype(np.int16).tobytes()
+                            # 2025-12-29: 调试输出 - 重采样前
+                            print(f"[DEBUG 2025-12-29] 重采样前 - 原始采样率: {self.actual_sample_rate}Hz, 目标采样率: {self.sample_rate}Hz, 样本数: {original_length}")
+                            
+                            # 2025-12-29-2: 使用高质量重采样（scipy）转换到vosk接收的16000Hz
+                            resampled_array = AudioProcessor.resample_high_quality(
+                                audio_array, 
+                                self.actual_sample_rate, 
+                                self.sample_rate
+                            )
+                            resampled_length = len(resampled_array)
+                            # 2025-12-29-2: 调试输出 - 重采样后
+                            print(f"[DEBUG 2025-12-29-2] 重采样后 - 样本数: {resampled_length}, 预期样本数: {int(original_length * self.sample_rate / self.actual_sample_rate)}, 数据格式: {resampled_array.dtype}")
+                            
+                            # 2025-12-29-2: 确保数据类型是int16
+                            if resampled_array.dtype != np.int16:
+                                print(f"[WARNING 2025-12-29-2] 重采样后数据类型不是int16 ({resampled_array.dtype})，正在转换")
+                                resampled_array = resampled_array.astype(np.int16)
+                            
+                            # 转换回字节
+                            audio_bytes = AudioProcessor.numpy_to_bytes(resampled_array, "int16")
+                            # 2025-12-29: 调试输出 - 最终音频数据
+                            print(f"[DEBUG 2025-12-29] 最终音频数据 - 长度: {len(audio_bytes)} 字节, 预期长度: {resampled_length * 2} 字节 (int16)")
                         except Exception as e:
-                            print(f"重采样失败: {e}，使用原始音频")
+                            print(f"[ERROR 2025-12-29] 重采样失败: {e}，使用原始音频")
+                            import traceback
+                            traceback.print_exc()
                     
                     # 调用回调函数处理累积的音频块
                     if self.callback:
                         try:
+                            # 2025-12-29: 调试输出 - 准备调用回调
+                            print(f"[DEBUG 2025-12-29] 准备调用音频回调 - 音频数据长度: {len(audio_bytes)} 字节")
                             self.callback(audio_bytes)
+                            print(f"[DEBUG 2025-12-29] 音频回调调用成功")
                         except Exception as e:
-                            print(f"音频回调处理错误: {e}")
+                            print(f"[ERROR 2025-12-29] 音频回调处理错误: {e}")
+                            import traceback
+                            traceback.print_exc()
                     
                     return (None, pyaudiowpatch.paContinue)
         
@@ -193,6 +238,9 @@ class LoopbackAudioCapture:
             if self.frame_volumes:
                 avg_volume = sum(self.frame_volumes) / len(self.frame_volumes)
             
+            # 2025-12-29: 调试输出 - 音量检查
+            print(f"[DEBUG 2025-12-29] 处理间隔触发 - 平均音量: {avg_volume:.2f}%, 阈值: {self.volume_threshold:.2f}%, 原始音频长度: {len(audio_bytes)} 字节")
+            
             # 清空累积的帧和音量
             self.frames = []
             self.frame_count = 0
@@ -200,30 +248,55 @@ class LoopbackAudioCapture:
             
             # 如果平均音量 <= 阈值，不传递给识别模型
             if avg_volume <= self.volume_threshold:
+                # 2025-12-29: 调试输出 - 音量阈值过滤
+                print(f"[WARNING 2025-12-29] 音频被音量阈值过滤 - 平均音量 {avg_volume:.2f}% <= 阈值 {self.volume_threshold:.2f}%，不传递给识别模型")
                 return (None, pyaudiowpatch.paContinue)
             
-            # 如果实际采样率与目标采样率不同，进行重采样
+            # 2025-12-29: 如果实际采样率与目标采样率不同，进行高质量重采样
             if self.actual_sample_rate != self.sample_rate:
                 try:
+                    from src.audio.processor import AudioProcessor
                     # 转换为numpy数组
-                    audio_array = np.frombuffer(audio_bytes, dtype=np.int16)
-                    # 重采样到目标采样率
-                    ratio = self.sample_rate / self.actual_sample_rate
+                    audio_array = AudioProcessor.bytes_to_numpy(audio_bytes, "int16")
                     original_length = len(audio_array)
-                    target_length = int(original_length * ratio)
-                    indices = np.linspace(0, original_length - 1, target_length)
-                    resampled_array = np.interp(indices, np.arange(original_length), audio_array)
-                    # 转换回int16并转为字节
-                    audio_bytes = resampled_array.astype(np.int16).tobytes()
+                    # 2025-12-29: 调试输出 - 重采样前
+                    print(f"[DEBUG 2025-12-29] 重采样前 - 原始采样率: {self.actual_sample_rate}Hz, 目标采样率: {self.sample_rate}Hz, 样本数: {original_length}")
+                    
+                    # 2025-12-29-2: 使用高质量重采样（scipy）转换到vosk接收的16000Hz
+                    resampled_array = AudioProcessor.resample_high_quality(
+                        audio_array, 
+                        self.actual_sample_rate, 
+                        self.sample_rate
+                    )
+                    resampled_length = len(resampled_array)
+                    # 2025-12-29-2: 调试输出 - 重采样后
+                    print(f"[DEBUG 2025-12-29-2] 重采样后 - 样本数: {resampled_length}, 预期样本数: {int(original_length * self.sample_rate / self.actual_sample_rate)}, 数据格式: {resampled_array.dtype}")
+                    
+                    # 2025-12-29-2: 确保数据类型是int16
+                    if resampled_array.dtype != np.int16:
+                        print(f"[WARNING 2025-12-29-2] 重采样后数据类型不是int16 ({resampled_array.dtype})，正在转换")
+                        resampled_array = resampled_array.astype(np.int16)
+                    
+                    # 转换回字节
+                    audio_bytes = AudioProcessor.numpy_to_bytes(resampled_array, "int16")
+                    # 2025-12-29: 调试输出 - 最终音频数据
+                    print(f"[DEBUG 2025-12-29] 最终音频数据 - 长度: {len(audio_bytes)} 字节, 预期长度: {resampled_length * 2} 字节 (int16)")
                 except Exception as e:
-                    print(f"重采样失败: {e}，使用原始音频")
+                    print(f"[ERROR 2025-12-29] 重采样失败: {e}，使用原始音频")
+                    import traceback
+                    traceback.print_exc()
             
             # 调用回调函数处理累积的音频块
             if self.callback:
                 try:
+                    # 2025-12-29: 调试输出 - 准备调用回调
+                    print(f"[DEBUG 2025-12-29] 准备调用音频回调 - 音频数据长度: {len(audio_bytes)} 字节")
                     self.callback(audio_bytes)
+                    print(f"[DEBUG 2025-12-29] 音频回调调用成功")
                 except Exception as e:
-                    print(f"音频回调处理错误: {e}")
+                    print(f"[ERROR 2025-12-29] 音频回调处理错误: {e}")
+                    import traceback
+                    traceback.print_exc()
         
         return (None, pyaudiowpatch.paContinue)
     
@@ -277,6 +350,14 @@ class LoopbackAudioCapture:
                 start=False
             )
             
+            # 2025-12-29: 如果实际采样率与目标采样率不同，提示将使用高质量重采样
+            if self.actual_sample_rate != self.sample_rate:
+                print(f"提示: 设备使用{self.actual_sample_rate}Hz采样率（目标{self.sample_rate}Hz），将自动使用高质量重采样转换到vosk接收的16000Hz")
+                # 2025-12-29: 不再使用ffmpeg重采样器，改为在回调中实时使用scipy高质量重采样
+                self.resampler = None
+            else:
+                self.resampler = None
+            
             # 重置累积帧和音量
             self.frames = []
             self.frame_count = 0
@@ -328,6 +409,8 @@ class LoopbackAudioCapture:
     def close(self) -> None:
         """关闭音频捕获并释放资源"""
         self.stop()
+        # 2025-12-29: 不再需要关闭ffmpeg重采样器（已弃用）
+        self.resampler = None
         if self.pa:
             try:
                 self.pa.terminate()

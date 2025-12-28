@@ -217,16 +217,26 @@ class VoskEngine:
     
     def start(self) -> None:
         """开始识别处理"""
+        # 2025-12-29: 调试输出 - 启动检查
         if self.is_processing:
+            print(f"[WARNING 2025-12-29] Vosk引擎已在处理状态，无需重复启动")
             return
         
         if not self.recognizer:
-            print("错误: 模型未加载，无法开始识别")
+            print(f"[ERROR 2025-12-29] 模型未加载，无法开始识别")
             return
+        
+        # 2025-12-29: 调试输出 - 启动信息
+        print(f"[DEBUG 2025-12-29] 启动Vosk识别引擎 - 采样率: {self.sample_rate}Hz, 模型语言: {self.language}, 说话人识别: {'启用' if self.speaker_id_enabled else '禁用'}")
         
         self.is_processing = True
         self.processing_thread = threading.Thread(target=self._process_audio, daemon=True)
         self.processing_thread.start()
+        
+        # 重置计数器
+        if hasattr(self, '_feed_count'):
+            self._feed_count = 0
+        
         print("Vosk识别引擎已启动")
     
     def stop(self) -> None:
@@ -255,8 +265,35 @@ class VoskEngine:
         Args:
             audio_data: 音频字节数据
         """
-        if self.is_processing and self.recognizer:
+        # 2025-12-29: 调试输出 - 音频数据接收检查
+        if not audio_data or len(audio_data) == 0:
+            print(f"[WARNING 2025-12-29] Vosk引擎收到空音频数据，跳过")
+            return
+        
+        if not self.is_processing:
+            print(f"[WARNING 2025-12-29] Vosk引擎未在处理状态 (is_processing={self.is_processing})，无法接收音频数据 (长度: {len(audio_data)} 字节)")
+            return
+        
+        if not self.recognizer:
+            print(f"[WARNING 2025-12-29] Vosk识别器未初始化，无法接收音频数据 (长度: {len(audio_data)} 字节)")
+            return
+        
+        # 2025-12-29: 调试输出 - 音频数据入队
+        try:
             self.audio_queue.put(audio_data)
+            # 2025-12-29: 调试输出 - 队列状态（每100个数据块输出一次，避免日志过多）
+            if hasattr(self, '_feed_count'):
+                self._feed_count += 1
+            else:
+                self._feed_count = 1
+            
+            if self._feed_count % 100 == 0:
+                queue_size = self.audio_queue.qsize()
+                print(f"[DEBUG 2025-12-29] Vosk引擎已接收 {self._feed_count} 个音频块，当前队列大小: {queue_size}, 最新块长度: {len(audio_data)} 字节")
+        except Exception as e:
+            print(f"[ERROR 2025-12-29] 音频数据入队失败: {e}")
+            import traceback
+            traceback.print_exc()
     
     def _cosine_similarity(self, vec1: List[float], vec2: List[float]) -> float:
         """计算两个向量的余弦相似度"""
@@ -364,12 +401,22 @@ class VoskEngine:
     
     def _process_audio(self) -> None:
         """音频处理线程"""
+        # 2025-12-29: 调试输出 - 处理线程启动
+        print(f"[DEBUG 2025-12-29] Vosk音频处理线程已启动")
+        processed_count = 0
+        
         while self.is_processing:
             try:
                 # 从队列获取音频数据
                 audio_data = self.audio_queue.get(timeout=0.1)
+                processed_count += 1
+                
+                # 2025-12-29: 调试输出 - 音频数据处理（每50个数据块输出一次）
+                if processed_count % 50 == 0:
+                    print(f"[DEBUG 2025-12-29] Vosk引擎已处理 {processed_count} 个音频块，当前块长度: {len(audio_data)} 字节")
                 
                 if not self.recognizer:
+                    print(f"[WARNING 2025-12-29] Vosk识别器未初始化，跳过音频数据处理")
                     continue
                 
                 # 识别音频
@@ -378,6 +425,12 @@ class VoskEngine:
                     result = json.loads(self.recognizer.Result())
                     text = result.get('text', '').strip()
                     spk = result.get('spk', None)  # 说话人特征向量
+                    
+                    # 2025-12-29: 调试输出 - 最终识别结果
+                    if text:
+                        print(f"[DEBUG 2025-12-29] Vosk最终识别结果: '{text}' (长度: {len(text)} 字符)")
+                    else:
+                        print(f"[WARNING 2025-12-29] Vosk最终识别结果为空")
                     
                     if text:
                         speaker_id = None
@@ -399,12 +452,24 @@ class VoskEngine:
                             speaker_id = 1
                         
                         if self.callback:
+                            # 2025-12-29: 调试输出 - 准备调用回调
+                            print(f"[DEBUG 2025-12-29] 准备调用识别结果回调 - 文本: '{text}', 说话人ID: {speaker_id}")
                             self.callback(text, True, spk, speaker_id, feature_hash)
+                            print(f"[DEBUG 2025-12-29] 识别结果回调调用成功")
+                        else:
+                            print(f"[WARNING 2025-12-29] 识别结果回调函数未设置，无法传递识别结果")
                 else:
                     # 部分结果
                     result = json.loads(self.recognizer.PartialResult())
                     text = result.get('partial', '').strip()
                     spk = result.get('spk', None)
+                    
+                    # 2025-12-29: 调试输出 - 部分识别结果（每20个输出一次，避免日志过多）
+                    if processed_count % 20 == 0:
+                        if text:
+                            print(f"[DEBUG 2025-12-29] Vosk部分识别结果: '{text}' (长度: {len(text)} 字符)")
+                        else:
+                            print(f"[DEBUG 2025-12-29] Vosk部分识别结果为空 (已处理 {processed_count} 个音频块)")
                     
                     if text and self.callback:
                         # 部分结果不进行说话人识别，但可以生成特征码用于显示
@@ -416,9 +481,12 @@ class VoskEngine:
             except queue.Empty:
                 continue
             except Exception as e:
-                print(f"音频处理错误: {e}")
+                print(f"[ERROR 2025-12-29] Vosk音频处理错误: {e}")
                 import traceback
                 traceback.print_exc()
                 continue
+        
+        # 2025-12-29: 调试输出 - 处理线程结束
+        print(f"[DEBUG 2025-12-29] Vosk音频处理线程已结束，共处理 {processed_count} 个音频块")
 
 

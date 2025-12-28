@@ -1271,20 +1271,32 @@ class MainWindow(QMainWindow):
         for device in loopback_devices:
             device_idx = device.get('index')
             device_name = device.get('name', 'Unknown')
+            is_default = device.get('isDefault', False)  # 2025-12-29: 检查是否为默认设备
             
-            # 格式化显示名称
+            # 2025-12-29: 格式化显示名称，标记默认设备
             display_name = f"[{device_idx}] {device_name}"
+            if is_default:
+                display_name += " (默认)"
             
             self.loopback_device_combo.addItem(display_name, device_idx)
             self.loopback_device_indices.append(device_idx)
         
-        # 设置桌面音频设备默认选择
+        # 2025-12-29: 设置桌面音频设备默认选择（优先选择系统默认输出设备的loopback）
         if default_loopback_index is not None:
             try:
                 idx = self.loopback_device_indices.index(default_loopback_index)
                 self.loopback_device_combo.setCurrentIndex(idx)
             except ValueError:
-                pass
+                # 如果配置的设备索引不存在，尝试查找默认设备
+                for i, device in enumerate(loopback_devices):
+                    if device.get('isDefault', False):
+                        try:
+                            idx = self.loopback_device_indices.index(device.get('index'))
+                            self.loopback_device_combo.setCurrentIndex(idx)
+                            print(f"自动选择默认桌面音频设备: [{device.get('index')}] {device.get('name', 'Unknown')}")
+                        except ValueError:
+                            pass
+                        break
         
         # 设置设备类型单选按钮
         if device_type == "input":
