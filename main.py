@@ -4,10 +4,12 @@ VR翻译器主程序
 """
 import sys
 import threading
+import ctypes
 from typing import Optional
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtCore import QTimer, pyqtSlot, QMetaObject, Qt
 
+from pathlib import Path
 from config import Config
 from src.audio.capture_cable import AudioCapture
 from src.audio.capture_loopback import LoopbackAudioCapture
@@ -15,6 +17,7 @@ from src.recognition.vosk_engine import VoskEngine
 from src.translation.api_client import TranslationClient
 from src.translation.context_manager import WeightedContextManager
 from src.ui.main_window import MainWindow
+
 
 class TranslatorApp:
     """翻译器应用主类"""
@@ -150,9 +153,29 @@ class TranslatorApp:
         self.window.clear_texts_signal.connect(self._on_clear_texts)
         self.window.update_used_chars_signal.connect(self._on_used_chars_updated)
         self.window.translation_status_updated_signal.connect(self.window.update_translation_status)
-    
+
+
     def _init_modules(self) -> None:
         """初始化各个模块"""
+        try:
+            # 2025-12-29-3: 检查models文件夹是否存在且不为空
+            models_dir = Path("models")
+            if not models_dir.exists() or not any(models_dir.iterdir()):
+                self._handle_missing_models()
+        except Exception as e:
+            print(f"\033[91m[ERROR] #####models文件夹不存在或为空#####: {e}\033[0m")   # 控制台给一个高亮
+            ctypes.windll.user32.MessageBoxW(0, "你的运行环境下models文件夹为空，检查是否准备了语音识别模型\n下载地址:alphacephei.com/vosk/models", "程序遇到一个错误 但你可以忽略它继续运行", 0x10)
+            # 2025-12-29-3: 放弃终止程序只报错
+
+        def _handle_missing_models(self):
+            """处理模型缺失情况的专用方法"""
+            print("\033[91m[ERROR] models文件夹不存在或为空！\033[0m")
+            print("\033[91m[ERROR] 请下载语音识别模型并放置在models目录下\033[0m")
+            try:
+                self.window.show_error("模型错误", "models文件夹不存在或为空！\n请下载语音识别模型并放置在models目录下")
+            except Exception as e:
+                print(f"\033[91m[ERROR] 无法显示错误对话框: {e}\033[0m")
+
         try:
             # 初始化音频捕获
             audio_config = self.config.get_audio_config()
@@ -195,15 +218,27 @@ class TranslatorApp:
             except Exception as e:
                 print(f"获取桌面音频设备列表失败: {e}")
             
+            # 2025-12-29: 默认选择系统默认输出设备的loopback
+            if loopback_device_index is None and loopback_devices:
+                # 查找标记为默认的设备
+                for device in loopback_devices:
+                    if device.get('isDefault', False):
+                        loopback_device_index = device.get('index')
+                        print(f"自动选择默认桌面音频设备: [{loopback_device_index}] {device.get('name', 'Unknown')}")
+                        # 保存到配置
+                        self.config.set("audio.loopback_device_index", loopback_device_index)
+                        self.config.save()
+                        break
+            
             # 更新GUI设备列表
             self.window.update_device_list(
-                input_devices, 
+                input_devices,
                 loopback_devices,
                 default_input_index=device_index,
                 default_loopback_index=loopback_device_index,
                 device_type=device_type
             )
-            
+
             # 根据设备类型创建对应的捕获对象（但不立即启动）
             if device_type == "input" and device_index is not None:
                 self.audio_capture = AudioCapture(
@@ -229,10 +264,10 @@ class TranslatorApp:
                     volume_threshold=volume_threshold,
                     sentence_break_interval=sentence_break_interval
                 )
-            
+
             # 不立即初始化Vosk引擎，等用户点击加载模型按钮
             self.vosk_engine: Optional[VoskEngine] = None
-            
+
             # 初始化翻译客户端
             trans_config = self.config.get_translation_config()
             self.translation_client = TranslationClient(
@@ -243,51 +278,78 @@ class TranslatorApp:
                 timeout=trans_config.get("timeout", 30),
                 trans_config=trans_config  # 传递配置以便访问提示词模板
             )
-            
+
             # 不再初始化VR Overlay
             self.vr_overlay = None
-            
+
             print("所有模块初始化完成")
             
         except Exception as e:
             print(f"模块初始化失败: {e}")
             self.window.show_error("初始化错误", f"模块初始化失败: {e}")
-    
+
     def _on_audio_chunk(self, audio_data: bytes) -> None:
         """音频块回调（累积的音频数据，约3秒）"""
+        # 2025-12-29: 调试输出_音频数据到达检查
         if not audio_data or len(audio_data) == 0:
+            print(f"[WARNING] 音频数据为空或长度为0，跳过处理")
             return
-        
-        if self.vosk_engine and self.is_recognizing:
-            # 将累积的音频块传递给Vosk引擎
-            # 注意：Vosk需要实时流，这里需要将块拆分成更小的块
-            chunk_size = 4000  # Vosk推荐的大小
-            for i in range(0, len(audio_data), chunk_size):
-                chunk = audio_data[i:i+chunk_size]
-                if len(chunk) > 0:
+
+        # 2025-12-29-2: 调试输出_识别引擎状态检查
+        if not self.vosk_engine:
+            print(f"[WARNING] vosk引擎未初始化，无法处理音频数据 (长度: {len(audio_data)} 字节)")
+            print(f"[INFO] 提示: 请先加载语音识别模型并开启识别功能")
+            return
+
+        if not self.is_recognizing:
+            print(f"[WARNING] 识别未开启 (is_recognizing={self.is_recognizing})，无法处理音频数据 (长度: {len(audio_data)} 字节)")
+            print(f"[INFO] 提示: 请先开启识别功能")
+            return
+
+        # 2025-12-29: 调试输出_准备传递音频数据
+        print(f"[DEBUG] 收到音频数据块 - 长度: {len(audio_data)} 字节, 准备传递给Vosk引擎")
+
+        # 将累积的音频块传递给Vosk引擎
+        # 注意：Vosk需要实时流，这里需要将块拆分成更小的块
+        chunk_size = 4000  # Vosk推荐的大小
+        chunk_count = 0
+        for i in range(0, len(audio_data), chunk_size):
+            chunk = audio_data[i:i+chunk_size]
+            if len(chunk) > 0:
+                chunk_count += 1
+                try:
                     self.vosk_engine.feed_audio(chunk)
-    
+                except Exception as e:
+                    print(f"[ERROR] 传递音频块到Vosk引擎失败: {e}")
+                    import traceback
+                    traceback.print_exc()
+
+        # 2025-12-29: 调试输出_音频数据传递完成
+        print(f"[DEBUG] 音频数据传递完成 - 总块数: {chunk_count}, 总长度: {len(audio_data)} 字节")
+
     def _on_volume_update(self, volume: float) -> None:
         """音量更新回调（在音频捕获线程中调用）"""
         # 直接使用信号emit（信号是线程安全的）
         self.window.volume_updated_signal.emit(volume)
-    
+
     def _on_recognition_result(self, text: str, is_final: bool, spk_embedding: Optional[list] = None, speaker_id: Optional[int] = None, feature_hash: str = "") -> None:
         """识别结果回调（可能在非主线程中调用）"""
         if not text or not text.strip():
             return
-        
+        # 2025-12-29-3: 移除识别文本中的所有空格 尝试1
+        text = text.replace(" ", "")
+
         # 获取当前模型文件夹名称，检查是否是英语模型
         vosk_config = self.config.get_vosk_config()
         current_model = vosk_config.get("language", "")
-        
+
         # 过滤英语模型的无效识别结果 'the'
         # 检查模型文件夹名称是否包含英语相关关键词
         if current_model and ("en" in current_model.lower() or "english" in current_model.lower()):
             text_stripped = text.strip().lower()
             if text_stripped == "the":
                 return  # 忽略无效的 'the' 识别结果
-        
+
         # 检查是否有多个说话人（至少2个），只有多个说话人才显示标识
         display_speaker_id = None
         display_feature_hash = ""
@@ -295,11 +357,11 @@ class TranslatorApp:
             if hasattr(self.vosk_engine, 'speaker_profiles') and len(self.vosk_engine.speaker_profiles) > 1:
                 display_speaker_id = speaker_id
                 display_feature_hash = feature_hash
-        
+
         # 直接使用信号emit（信号是线程安全的）
         # 传递原始文本、说话人ID和特征码，让UI层决定如何显示
         self.window.recognition_text_updated_signal.emit(text, is_final, display_speaker_id, display_feature_hash)
-        
+
         if self.is_translating:
             if is_final:
                 # 完整句子翻译
@@ -801,6 +863,32 @@ class TranslatorApp:
                 
                 self.audio_capture.start()
             else:  # loopback
+                # 2025-12-29: 如果未配置loopback设备索引,尝试自动选择系统默认输出设备的loopback
+                if loopback_device_index is None:
+                    try:
+                        temp_loopback = LoopbackAudioCapture(
+                            sample_rate=audio_config.get("sample_rate", 16000),
+                            channels=audio_config.get("channels", 1),
+                            process_interval_seconds=process_interval_seconds,
+                            format=audio_config.get("format", "int16"),
+                            device_index=None,
+                            sentence_break_interval=sentence_break_interval
+                        )
+                        loopback_devices = temp_loopback.get_available_devices()
+                        temp_loopback.close()
+                        
+                        # 查找默认设备
+                        for device in loopback_devices:
+                            if device.get('isDefault', False):
+                                loopback_device_index = device.get('index')
+                                print(f"自动选择默认桌面音频设备: [{loopback_device_index}] {device.get('name', 'Unknown')}")
+                                # 保存到配置
+                                self.config.set("audio.loopback_device_index", loopback_device_index)
+                                self.config.save()
+                                break
+                    except Exception as e:
+                        print(f"自动选择默认设备失败: {e}")
+                
                 if loopback_device_index is None:
                     self.window.show_error("错误", "请先选择桌面音频设备")
                     return
@@ -1091,6 +1179,19 @@ class TranslatorApp:
             device_type = audio_config.get("device_type", "input")
             default_input_index = audio_config.get("device_index")
             default_loopback_index = audio_config.get("loopback_device_index")
+            
+            # 2025-12-29: 如果未配置loopback设备索引默认选择系统默认输出设备的loopback
+            if default_loopback_index is None and loopback_devices:
+                # 查找标记为默认的设备
+                for device in loopback_devices:
+                    if device.get('isDefault', False):
+                        default_loopback_index = device.get('index')
+                        print(f"自动选择默认桌面音频设备: [{default_loopback_index}] {device.get('name', 'Unknown')}")
+                        # 保存到配置
+                        self.config.set("audio.loopback_device_index", default_loopback_index)
+                        self.config.save()
+                        break
+            
             self.window.update_device_list(
                 input_devices,
                 loopback_devices,
