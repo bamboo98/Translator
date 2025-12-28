@@ -64,6 +64,9 @@ class LoopbackAudioCapture:
         import time
         self.time = time  # 保存time模块引用
         
+        # ffmpeg 重采样器（延迟初始化，在 start() 中根据实际采样率创建）
+        self.resampler = None
+        
         # 查找设备
         if device_index is None:
             self.device_index = None  # 将在start()中使用默认WASAPI环回设备
@@ -161,16 +164,18 @@ class LoopbackAudioCapture:
                     # 如果实际采样率与目标采样率不同，进行重采样
                     if self.actual_sample_rate != self.sample_rate:
                         try:
+                            from src.audio.processor import AudioProcessor
                             # 转换为numpy数组
-                            audio_array = np.frombuffer(audio_bytes, dtype=np.int16)
-                            # 重采样到目标采样率
-                            ratio = self.sample_rate / self.actual_sample_rate
-                            original_length = len(audio_array)
-                            target_length = int(original_length * ratio)
-                            indices = np.linspace(0, original_length - 1, target_length)
-                            resampled_array = np.interp(indices, np.arange(original_length), audio_array)
-                            # 转换回int16并转为字节
-                            audio_bytes = resampled_array.astype(np.int16).tobytes()
+                            audio_array = AudioProcessor.bytes_to_numpy(audio_bytes, "int16")
+                            # 使用 ffmpeg 重采样（如果可用）或回退到简单插值
+                            resampled_array = AudioProcessor.resample(
+                                audio_array, 
+                                self.actual_sample_rate, 
+                                self.sample_rate,
+                                resampler=self.resampler
+                            )
+                            # 转换回字节
+                            audio_bytes = AudioProcessor.numpy_to_bytes(resampled_array, "int16")
                         except Exception as e:
                             print(f"重采样失败: {e}，使用原始音频")
                     
@@ -205,16 +210,18 @@ class LoopbackAudioCapture:
             # 如果实际采样率与目标采样率不同，进行重采样
             if self.actual_sample_rate != self.sample_rate:
                 try:
+                    from src.audio.processor import AudioProcessor
                     # 转换为numpy数组
-                    audio_array = np.frombuffer(audio_bytes, dtype=np.int16)
-                    # 重采样到目标采样率
-                    ratio = self.sample_rate / self.actual_sample_rate
-                    original_length = len(audio_array)
-                    target_length = int(original_length * ratio)
-                    indices = np.linspace(0, original_length - 1, target_length)
-                    resampled_array = np.interp(indices, np.arange(original_length), audio_array)
-                    # 转换回int16并转为字节
-                    audio_bytes = resampled_array.astype(np.int16).tobytes()
+                    audio_array = AudioProcessor.bytes_to_numpy(audio_bytes, "int16")
+                    # 使用 ffmpeg 重采样（如果可用）或回退到简单插值
+                    resampled_array = AudioProcessor.resample(
+                        audio_array, 
+                        self.actual_sample_rate, 
+                        self.sample_rate,
+                        resampler=self.resampler
+                    )
+                    # 转换回字节
+                    audio_bytes = AudioProcessor.numpy_to_bytes(resampled_array, "int16")
                 except Exception as e:
                     print(f"重采样失败: {e}，使用原始音频")
             
@@ -277,6 +284,25 @@ class LoopbackAudioCapture:
                 start=False
             )
             
+            # 如果实际采样率与目标采样率不同，创建 ffmpeg 重采样器
+            if self.actual_sample_rate != self.sample_rate:
+                print(f"提示: 设备使用{self.actual_sample_rate}Hz采样率（目标{self.sample_rate}Hz），将自动重采样")
+                try:
+                    from src.audio.processor import FFmpegResampler
+                    self.resampler = FFmpegResampler(
+                        original_rate=self.actual_sample_rate,
+                        target_rate=self.sample_rate,
+                        format="s16le",  # loopback 使用 int16
+                        channels=self.channels
+                    )
+                    if self.resampler.enabled:
+                        print(f"已启用 ffmpeg 高质量重采样 ({self.actual_sample_rate}Hz -> {self.sample_rate}Hz)")
+                except Exception as e:
+                    print(f"创建 ffmpeg 重采样器失败: {e}，将使用简单插值重采样")
+                    self.resampler = None
+            else:
+                self.resampler = None
+            
             # 重置累积帧和音量
             self.frames = []
             self.frame_count = 0
@@ -328,6 +354,13 @@ class LoopbackAudioCapture:
     def close(self) -> None:
         """关闭音频捕获并释放资源"""
         self.stop()
+        # 确保关闭重采样器
+        if self.resampler:
+            try:
+                self.resampler.close()
+            except:
+                pass
+            self.resampler = None
         if self.pa:
             try:
                 self.pa.terminate()
