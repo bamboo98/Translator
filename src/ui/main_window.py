@@ -5,7 +5,7 @@ from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QPushButton, QTextEdit, QLabel, QComboBox,
                              QLineEdit, QGroupBox, QStatusBar, QMessageBox,
                              QSplitter, QProgressBar, QTabWidget, QSpinBox,
-                             QDoubleSpinBox, QCheckBox)
+                             QDoubleSpinBox, QCheckBox, QRadioButton, QButtonGroup)
 from PyQt6.QtCore import Qt, pyqtSignal, QThread, QTimer
 from PyQt6.QtGui import QFont, QColor, QPalette
 from typing import Optional, Callable, Dict, Any
@@ -20,6 +20,8 @@ class MainWindow(QMainWindow):
     load_model_signal = pyqtSignal()  # 加载模型
     recognition_start_signal = pyqtSignal()  # 开启识别
     recognition_stop_signal = pyqtSignal()  # 关闭识别
+    recognition_method_changed_signal = pyqtSignal(int)  # 识别方式改变信号 (0=Vosk, 1=LiveCaptions)
+    open_live_captions_signal = pyqtSignal()  # 打开实时字幕信号
     translation_start_signal = pyqtSignal()  # 开启翻译
     translation_stop_signal = pyqtSignal()  # 关闭翻译
     language_changed_signal = pyqtSignal(str)  # 语言改变（仅用于下拉框选择，不加载模型）
@@ -782,19 +784,50 @@ class MainWindow(QMainWindow):
     def _create_recognition_control_panel(self) -> QGroupBox:
         """创建识别控制面板"""
         group = QGroupBox("语音识别")
-        layout = QHBoxLayout()
+        layout = QVBoxLayout()
+        
+        # 第一行：识别方式选择（按钮组）
+        method_layout = QHBoxLayout()
+        method_layout.addWidget(QLabel("识别方式:"))
+        
+        self.recognition_method_group = QButtonGroup(self)
+        self.vosk_method_btn = QRadioButton("Vosk识别")
+        self.vosk_method_btn.setChecked(True)  # 默认选择Vosk
+        self.live_captions_method_btn = QRadioButton("Win11实时字幕")
+        
+        self.recognition_method_group.addButton(self.vosk_method_btn, 0)
+        self.recognition_method_group.addButton(self.live_captions_method_btn, 1)
+        
+        method_layout.addWidget(self.vosk_method_btn)
+        method_layout.addWidget(self.live_captions_method_btn)
+        method_layout.addStretch()
+        
+        # 连接信号，当选择方式改变时更新按钮状态
+        self.vosk_method_btn.toggled.connect(self._on_recognition_method_changed)
+        self.live_captions_method_btn.toggled.connect(self._on_recognition_method_changed)
+        
+        layout.addLayout(method_layout)
+        
+        # 第二行：控制按钮
+        control_layout = QHBoxLayout()
         
         self.recognition_btn = QPushButton("开启识别")
         self.recognition_btn.clicked.connect(self._on_recognition_clicked)
         self.recognition_btn.setEnabled(False)  # 初始禁用，需要监听和模型都准备好
-        layout.addWidget(self.recognition_btn)
+        control_layout.addWidget(self.recognition_btn)
         
-        # 清空按钮移到开启识别按钮后面
+        self.open_live_captions_btn = QPushButton("打开实时字幕")
+        self.open_live_captions_btn.clicked.connect(self._on_open_live_captions_clicked)
+        control_layout.addWidget(self.open_live_captions_btn)
+        
+        # 清空按钮
         self.clear_texts_btn = QPushButton("清空")
         self.clear_texts_btn.clicked.connect(self._on_clear_texts_clicked)
-        layout.addWidget(self.clear_texts_btn)
+        control_layout.addWidget(self.clear_texts_btn)
         
-        layout.addStretch()
+        control_layout.addStretch()
+        
+        layout.addLayout(control_layout)
         
         group.setLayout(layout)
         return group
@@ -1116,6 +1149,19 @@ class MainWindow(QMainWindow):
             self.recognition_start_signal.emit()
         else:
             self.recognition_stop_signal.emit()
+    
+    def _on_recognition_method_changed(self) -> None:
+        """识别方式改变事件"""
+        if self.live_captions_method_btn.isChecked():
+            # 选择了Win11实时字幕，视为已开启监听并加载模型
+            self.recognition_method_changed_signal.emit(1)
+        else:
+            # 选择了Vosk识别
+            self.recognition_method_changed_signal.emit(0)
+    
+    def _on_open_live_captions_clicked(self) -> None:
+        """打开实时字幕按钮点击事件"""
+        self.open_live_captions_signal.emit()
     
     def _on_translation_clicked(self) -> None:
         """翻译按钮点击事件"""
@@ -1594,9 +1640,17 @@ class MainWindow(QMainWindow):
     
     def _update_recognition_button_state(self) -> None:
         """更新识别按钮的启用状态"""
-        # 需要监听开启且模型已加载
-        can_enable = self.is_listening and self.model_path_label.text() != "未加载"
+        # 如果选择了实时字幕，视为已开启监听并加载模型
+        if hasattr(self, 'live_captions_method_btn') and self.live_captions_method_btn.isChecked():
+            can_enable = True
+        else:
+            # Vosk识别需要监听开启且模型已加载
+            can_enable = self.is_listening and self.model_path_label.text() != "未加载"
         self.recognition_btn.setEnabled(can_enable)
+    
+    def set_recognition_button_enabled(self, enabled: bool) -> None:
+        """设置识别按钮启用状态"""
+        self.recognition_btn.setEnabled(enabled)
     
     def _update_translation_button_state(self) -> None:
         """更新翻译按钮的启用状态"""

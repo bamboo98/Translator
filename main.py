@@ -12,9 +12,13 @@ from config import Config
 from src.audio.capture_cable import AudioCapture
 from src.audio.capture_loopback import LoopbackAudioCapture
 from src.recognition.vosk_engine import VoskEngine
+from src.recognition.live_captions_engine import LiveCaptionsEngine
 from src.translation.api_client import TranslationClient
 from src.translation.context_manager import WeightedContextManager
 from src.ui.main_window import MainWindow
+import psutil
+import subprocess
+import os
 
 class TranslatorApp:
     """翻译器应用主类"""
@@ -27,6 +31,7 @@ class TranslatorApp:
         self.audio_capture: Optional[AudioCapture] = None
         self.loopback_capture: Optional[LoopbackAudioCapture] = None
         self.vosk_engine: Optional[VoskEngine] = None
+        self.live_captions_engine: Optional[LiveCaptionsEngine] = None
         self.translation_client: Optional[TranslationClient] = None
         # 初始化上下文管理器（使用配置）
         trans_config = self.config.get_translation_config()
@@ -40,6 +45,7 @@ class TranslatorApp:
         self.is_translating = False
         self.model_loaded = False
         self.current_text = ""
+        self.recognition_method = 0  # 0=Vosk, 1=LiveCaptions
         
         # 翻译请求状态管理（事件驱动模式）
         self.pending_translate_request: Optional[dict] = None  # 等待中的请求：{"text": str, "type": "instant"/"full", "context_prompt": str, "last_text": str, "speaker_id": Optional[int]}
@@ -130,6 +136,8 @@ class TranslatorApp:
         self.window.load_model_signal.connect(self.load_model)
         self.window.recognition_start_signal.connect(self.start_recognition)
         self.window.recognition_stop_signal.connect(self.stop_recognition)
+        self.window.recognition_method_changed_signal.connect(self._on_recognition_method_changed)
+        self.window.open_live_captions_signal.connect(self._on_open_live_captions)
         self.window.translation_start_signal.connect(self.start_translation)
         self.window.translation_stop_signal.connect(self.stop_translation)
         # 不再需要language_changed_signal，UI自己处理
@@ -277,22 +285,29 @@ class TranslatorApp:
         if not text or not text.strip():
             return
         
-        # 获取当前模型文件夹名称，检查是否是英语模型
-        vosk_config = self.config.get_vosk_config()
-        current_model = vosk_config.get("language", "")
-        
-        # 过滤英语模型的无效识别结果 'the'
-        # 检查模型文件夹名称是否包含英语相关关键词
-        if current_model and ("en" in current_model.lower() or "english" in current_model.lower()):
-            text_stripped = text.strip().lower()
-            if text_stripped == "the":
-                return  # 忽略无效的 'the' 识别结果
+        # 实时字幕不需要过滤the，直接跳过
+        if self.recognition_method == 1:  # LiveCaptions
+            pass  # 实时字幕不需要过滤
+        else:
+            # Vosk识别：获取当前模型文件夹名称，检查是否是英语模型
+            vosk_config = self.config.get_vosk_config()
+            current_model = vosk_config.get("language", "")
+            
+            # 过滤英语模型的无效识别结果 'the'
+            # 检查模型文件夹名称是否包含英语相关关键词
+            if current_model and ("en" in current_model.lower() or "english" in current_model.lower()):
+                text_stripped = text.strip().lower()
+                if text_stripped == "the":
+                    return  # 忽略无效的 'the' 识别结果
         
         # 检查是否有多个说话人（至少2个），只有多个说话人才显示标识
         display_speaker_id = None
         display_feature_hash = ""
         if is_final and speaker_id is not None:
-            if hasattr(self.vosk_engine, 'speaker_profiles') and len(self.vosk_engine.speaker_profiles) > 1:
+            # 实时字幕的speaker_id始终为1，不显示
+            if self.recognition_method == 1:  # LiveCaptions
+                display_speaker_id = None  # 实时字幕不显示说话人ID
+            elif self.vosk_engine and hasattr(self.vosk_engine, 'speaker_profiles') and len(self.vosk_engine.speaker_profiles) > 1:
                 display_speaker_id = speaker_id
                 display_feature_hash = feature_hash
         
@@ -474,11 +489,6 @@ class TranslatorApp:
                         # 更新UI显示状态（使用信号确保线程安全）
                         self.window.translation_status_updated_signal.emit(self.is_translating, self.is_waiting_for_response, self.translate_times.copy())
                         
-                        # 检查API密钥
-                        if not self.translation_client or not self.translation_client.api_key:
-                            print("警告: API密钥未设置，无法翻译")
-                            self.is_waiting_for_response = False
-                            continue
                         
                         # 记录请求数据
                         request_data = {
@@ -497,6 +507,11 @@ class TranslatorApp:
                             if request["type"] == "full":
                                 # 完整翻译
                                 if use_ai:
+                                    # 检查API密钥
+                                    if not self.translation_client or not self.translation_client.api_key:
+                                        print("警告: API密钥未设置，无法翻译")
+                                        self.is_waiting_for_response = False
+                                        continue
                                     # 使用AI翻译
                                     start_time = time.time()
                                     result = loop.run_until_complete(
@@ -618,6 +633,12 @@ class TranslatorApp:
                                     else:
                                         print(f"即时机器翻译失败: 返回结果为空")
                                 else:
+                                    
+                                    # 检查API密钥
+                                    if not self.translation_client or not self.translation_client.api_key:
+                                        print("警告: API密钥未设置，无法翻译")
+                                        self.is_waiting_for_response = False
+                                        continue
                                     # 使用AI翻译
                                     instant_prompt_template = trans_config.get("instant_prompt_template", "")
                                     
@@ -910,30 +931,114 @@ class TranslatorApp:
             self.model_loaded = False
             self.window.set_model_loaded("")
     
+    def _on_recognition_method_changed(self, method: int) -> None:
+        """识别方式改变事件"""
+        self.recognition_method = method
+        if method == 1:  # LiveCaptions
+            # 选择Win11实时字幕，视为已开启监听并加载模型，启用开启识别按钮
+            self.window.set_recognition_button_enabled(True)
+        else:  # Vosk
+            # 选择Vosk识别，需要检查监听和模型状态
+            can_enable = self.is_listening and self.model_loaded
+            self.window.set_recognition_button_enabled(can_enable)
+    
+    def _on_open_live_captions(self) -> None:
+        """打开实时字幕"""
+        try:
+            # 检查LiveCaptions.exe进程是否存在
+            process_found = False
+            for proc in psutil.process_iter(['pid', 'name']):
+                try:
+                    if proc.info['name'] and 'LiveCaptions.exe' in proc.info['name']:
+                        process_found = True
+                        break
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+            
+            if not process_found:
+                # 尝试启动LiveCaptions.exe
+                live_captions_path = r"C:\Windows\System32\LiveCaptions.exe"
+                if os.path.exists(live_captions_path):
+                    try:
+                        subprocess.Popen([live_captions_path], shell=False)
+                        self.window.status_bar.showMessage("正在启动实时字幕...", 2000)
+                    except Exception as e:
+                        print(f"启动实时字幕失败: {e}")
+                        self.window.show_error("错误", f"启动实时字幕失败: {e}")
+                else:
+                    self.window.show_error("错误", f"未找到实时字幕程序: {live_captions_path}")
+            else:
+                self.window.status_bar.showMessage("实时字幕已在运行", 2000)
+        except Exception as e:
+            print(f"打开实时字幕失败: {e}")
+            self.window.show_error("错误", f"打开实时字幕失败: {e}")
+    
     def start_recognition(self) -> None:
         """开启识别"""
         if self.is_recognizing:
             return
         
-        if not self.is_listening:
-            self.window.show_error("错误", "请先开启监听")
-            return
-        
-        if not self.model_loaded or not self.vosk_engine:
-            self.window.show_error("错误", "请先加载语音识别模型")
-            return
-        
-        try:
-            if self.vosk_engine:
-                self.vosk_engine.start()
-            self.is_recognizing = True
-            self.window.set_recognition_state(True)
-            # 开启识别时只清空识别文本
-            self.window.clear_recognition_text()
-            self.window.status_bar.showMessage("识别已开启", 2000)
-        except Exception as e:
-            print(f"开启识别失败: {e}")
-            self.window.show_error("错误", f"开启识别失败: {e}")
+        if self.recognition_method == 0:  # Vosk识别
+            if not self.is_listening:
+                self.window.show_error("错误", "请先开启监听")
+                return
+            
+            if not self.model_loaded or not self.vosk_engine:
+                self.window.show_error("错误", "请先加载语音识别模型")
+                return
+            
+            try:
+                if self.vosk_engine:
+                    self.vosk_engine.start()
+                self.is_recognizing = True
+                self.window.set_recognition_state(True)
+                # 开启识别时只清空识别文本
+                self.window.clear_recognition_text()
+                self.window.status_bar.showMessage("识别已开启", 2000)
+            except Exception as e:
+                print(f"开启识别失败: {e}")
+                self.window.show_error("错误", f"开启识别失败: {e}")
+        else:  # LiveCaptions识别
+            # 检查LiveCaptions.exe进程
+            process_found = False
+            for proc in psutil.process_iter(['pid', 'name']):
+                try:
+                    if proc.info['name'] and 'LiveCaptions.exe' in proc.info['name']:
+                        process_found = True
+                        break
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+            
+            if not process_found:
+                # 尝试启动LiveCaptions.exe
+                live_captions_path = r"C:\Windows\System32\LiveCaptions.exe"
+                if os.path.exists(live_captions_path):
+                    try:
+                        subprocess.Popen([live_captions_path], shell=False)
+                        # 等待一下让程序启动
+                        import time
+                        time.sleep(1)
+                    except Exception as e:
+                        print(f"启动实时字幕失败: {e}")
+                        self.window.show_error("错误", f"启动实时字幕失败: {e}")
+                        return
+                else:
+                    self.window.show_error("错误", f"未找到实时字幕程序: {live_captions_path}")
+                    return
+            
+            # 初始化LiveCaptions引擎
+            if not self.live_captions_engine:
+                self.live_captions_engine = LiveCaptionsEngine(callback=self._on_recognition_result)
+            
+            # 启动字幕监听
+            if self.live_captions_engine.start():
+                self.is_recognizing = True
+                self.window.set_recognition_state(True)
+                # 开启识别时只清空识别文本
+                self.window.clear_recognition_text()
+                self.window.status_bar.showMessage("实时字幕识别已开启", 2000)
+            else:
+                self.window.show_error("错误", "启动实时字幕监听失败，请确保已开启Windows 11实时字幕")
     
     def stop_recognition(self) -> None:
         """关闭识别"""
@@ -945,8 +1050,13 @@ class TranslatorApp:
             if self.is_translating:
                 self.stop_translation()
             
-            if self.vosk_engine:
-                self.vosk_engine.stop()
+            if self.recognition_method == 0:  # Vosk识别
+                if self.vosk_engine:
+                    self.vosk_engine.stop()
+            else:  # LiveCaptions识别
+                if self.live_captions_engine:
+                    self.live_captions_engine.stop()
+            
             self.is_recognizing = False
             self.window.set_recognition_state(False)
             # 关闭识别时不清空识别文本
