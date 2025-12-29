@@ -792,11 +792,17 @@ class MainWindow(QMainWindow):
         
         self.recognition_method_group = QButtonGroup(self)
         self.vosk_method_btn = QRadioButton("Vosk识别")
-        self.vosk_method_btn.setChecked(True)  # 默认选择Vosk
         self.live_captions_method_btn = QRadioButton("Win11实时字幕")
         
         self.recognition_method_group.addButton(self.vosk_method_btn, 0)
         self.recognition_method_group.addButton(self.live_captions_method_btn, 1)
+        
+        # 从配置加载识别方式
+        recognition_method = self.config.get("recognition.method", 0)
+        if recognition_method == 1:
+            self.live_captions_method_btn.setChecked(True)
+        else:
+            self.vosk_method_btn.setChecked(True)  # 默认选择Vosk
         
         method_layout.addWidget(self.vosk_method_btn)
         method_layout.addWidget(self.live_captions_method_btn)
@@ -813,7 +819,12 @@ class MainWindow(QMainWindow):
         
         self.recognition_btn = QPushButton("开启识别")
         self.recognition_btn.clicked.connect(self._on_recognition_clicked)
-        self.recognition_btn.setEnabled(False)  # 初始禁用，需要监听和模型都准备好
+        # 初始状态：根据识别方式决定是否启用
+        # 如果是实时字幕，视为已准备好；否则需要等待监听和模型加载
+        if recognition_method == 1:
+            self.recognition_btn.setEnabled(True)  # 实时字幕可以直接启用
+        else:
+            self.recognition_btn.setEnabled(False)  # Vosk需要监听和模型都准备好
         control_layout.addWidget(self.recognition_btn)
         
         self.open_live_captions_btn = QPushButton("打开实时字幕")
@@ -892,6 +903,25 @@ class MainWindow(QMainWindow):
         
         manual_layout.addStretch()
         layout.addLayout(manual_layout)
+        
+        # 第四行：即时翻译配置
+        instant_config_layout = QHBoxLayout()
+        instant_config_layout.addWidget(QLabel("即时翻译间隔(秒):"))
+        self.instant_translate_interval_spin = QDoubleSpinBox()
+        self.instant_translate_interval_spin.setRange(0.5, 10.0)
+        self.instant_translate_interval_spin.setSingleStep(0.5)
+        self.instant_translate_interval_spin.setValue(trans_config.get("instant_translate_interval", 3.5))
+        self.instant_translate_interval_spin.setDecimals(1)
+        instant_config_layout.addWidget(self.instant_translate_interval_spin)
+        
+        instant_config_layout.addWidget(QLabel("触发字数:"))
+        self.instant_translate_trigger_chars_spin = QSpinBox()
+        self.instant_translate_trigger_chars_spin.setRange(1, 100)
+        self.instant_translate_trigger_chars_spin.setValue(trans_config.get("instant_translate_trigger_chars", 8))
+        instant_config_layout.addWidget(self.instant_translate_trigger_chars_spin)
+        
+        instant_config_layout.addStretch()
+        layout.addLayout(instant_config_layout)
         
         group.setLayout(layout)
         return group

@@ -45,7 +45,9 @@ class TranslatorApp:
         self.is_translating = False
         self.model_loaded = False
         self.current_text = ""
-        self.recognition_method = 0  # 0=Vosk, 1=LiveCaptions
+        # 从配置加载识别方式
+        self.recognition_method = self.config.get("recognition.method", 0)  # 0=Vosk, 1=LiveCaptions
+        self.last_instant_translate_time = 0.0  # 上次即时翻译请求时间
         
         # 翻译请求状态管理（事件驱动模式）
         self.pending_translate_request: Optional[dict] = None  # 等待中的请求：{"text": str, "type": "instant"/"full", "context_prompt": str, "last_text": str, "speaker_id": Optional[int]}
@@ -327,9 +329,32 @@ class TranslatorApp:
                 trans_config = self.config.get_translation_config()
                 instant_translate_enabled = trans_config.get("instant_translate", False)
                 if instant_translate_enabled:
-                    text_utf8_len = len(text.encode('utf-8'))
-                    if text_utf8_len > 8:
+                    import time
+                    current_time = time.time()
+                    instant_interval = trans_config.get("instant_translate_interval", 3.5)
+                    trigger_chars = trans_config.get("instant_translate_trigger_chars", 8)
+                    
+                    # 检查间隔时间
+                    if current_time - self.last_instant_translate_time < instant_interval:
+                        return  # 间隔时间未到，不触发即时翻译
+                    
+                    # 检查触发字数
+                    should_trigger = False
+                    # 检查是否是英文（只含常规ASCII字符）
+                    is_english = all(ord(c) < 128 and (c.isalnum() or c.isspace() or c in ".,!?;:'\"-") for c in text)
+                    
+                    if is_english:
+                        # 英文：按单词数计算（空格数+1）
+                        word_count = len([w for w in text.split() if w.strip()])
+                        should_trigger = word_count >= trigger_chars
+                    else:
+                        # 非英文：按UTF-8字符数计算
+                        text_utf8_len = len(text.encode('utf-8'))
+                        should_trigger = text_utf8_len > trigger_chars
+                    
+                    if should_trigger:
                         # 即时翻译请求
+                        self.last_instant_translate_time = current_time
                         self._request_translate(text, "instant", "", "", display_speaker_id)
     
     def _request_translate(self, text: str, request_type: str, context_prompt: str = "", last_text: str = "", speaker_id: Optional[int] = None) -> None:
@@ -412,11 +437,18 @@ class TranslatorApp:
             result_stripped = result.strip()
             # 移除可能的代码块标记（```json ... ```）
             # 匹配 ```json 或 ``` 开头和 ``` 结尾
-            code_block_pattern = r'^```(?:json)?\s*\n?(.*?)\n?```\s*$'
+            code_block_pattern = r'^```(?:json)?\s*?(.*?)\s*```\s*$'
             code_block_match = re.match(code_block_pattern, result_stripped, re.DOTALL)
             if code_block_match:
                 # 提取代码块中的内容
                 result_stripped = code_block_match.group(1).strip()
+            
+            # 处理特殊格式：json\n{"v":30,"t":"..."}
+            # 匹配 json\n 开头的情况
+            json_prefix_pattern = r'^json\s*(.*)$'
+            json_prefix_match = re.match(json_prefix_pattern, result_stripped, re.DOTALL)
+            if json_prefix_match:
+                result_stripped = json_prefix_match.group(1).strip()
             
             # 尝试解析JSON
             parsed = json.loads(result_stripped)
@@ -934,6 +966,10 @@ class TranslatorApp:
     def _on_recognition_method_changed(self, method: int) -> None:
         """识别方式改变事件"""
         self.recognition_method = method
+        # 保存识别方式到配置
+        self.config.set("recognition.method", method)
+        self.config.save()
+        
         if method == 1:  # LiveCaptions
             # 选择Win11实时字幕，视为已开启监听并加载模型，启用开启识别按钮
             self.window.set_recognition_button_enabled(True)
@@ -1277,6 +1313,10 @@ class TranslatorApp:
             # 保存即时翻译设置
             if hasattr(self.window, 'instant_translate_checkbox'):
                 self.config.set("translation.instant_translate", self.window.instant_translate_checkbox.isChecked())
+            if hasattr(self.window, 'instant_translate_interval_spin'):
+                self.config.set("translation.instant_translate_interval", self.window.instant_translate_interval_spin.value())
+            if hasattr(self.window, 'instant_translate_trigger_chars_spin'):
+                self.config.set("translation.instant_translate_trigger_chars", self.window.instant_translate_trigger_chars_spin.value())
             
             # 保存机器翻译设置
             if hasattr(self.window, 'tencent_secret_id_edit'):

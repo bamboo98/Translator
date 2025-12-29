@@ -38,6 +38,8 @@ class Config:
             "prompt_template": "你是一个为VRChat提供实时翻译的专业同声传译助手\n- 翻译成口语化的中文,保留语气词,前文和上一句无需翻译\n- 原文为语音识别,可能存在断句问题和同/近音词错误,结合上下文推测完整且正确的语句\n- 输出格式:紧凑json,例{\"v\":30,\"t\":\"翻译结果\"},字段v表示该段翻译的重要性,整数取值0~99,越重要的段落会在前文参考中记忆越久,字段t中不需要任何解释或备注,推测的翻译部分加上括号,使用\\n换行\n\n前文参考:\n{context}\n\n上一句是:{last}\n\n待翻译内容:\n{text}",
             "instant_prompt_template": "翻译成中文,不完整的部分使用...代替,只输出翻译结果,不需要任何解释或备注:\n{text}",
             "instant_translate": False,  # 是否启用即时翻译
+            "instant_translate_interval": 3.5,  # 即时翻译间隔时间（秒），默认3.5秒
+            "instant_translate_trigger_chars": 8,  # 即时翻译触发字数（默认8字符），英文按单词数计算
             "use_ai_translation": True,  # 是否使用AI翻译（大模型）
             "instant_use_machine_translation": True,  # 即时翻译是否使用机器翻译
             "machine_translation": {
