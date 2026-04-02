@@ -8,6 +8,9 @@ on:
 jobs:
   build:
     runs-on: windows-latest
+    # Windows 默认控制台为 cp1252，Python print 中文会触发 UnicodeEncodeError
+    env:
+      PYTHONIOENCODING: utf-8
 
     steps:
     - name: Checkout code
@@ -33,7 +36,7 @@ jobs:
 
     - name: Move executable to root
       run: |
-        move dist\Translator.exe .
+        move dist\Translator\Translator.exe .
 
     - name: Get current commit ID
       run: |

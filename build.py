@@ -1,6 +1,15 @@
 import PyInstaller.__main__
 import os
+import sys
 from pathlib import Path
+
+# Windows 控制台常为 cp1252，直接 print 中文会在 CI 等处报错
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except (OSError, ValueError):
+        pass
 
 # 尝试找到 vosk 的安装位置并手动收集 DLL 文件
 # 因为 vosk 的 DLL 加载机制特殊，需要确保 DLL 被正确打包
