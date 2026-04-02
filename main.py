@@ -129,6 +129,11 @@ class TranslatorApp:
         # 初始化模块
         self._init_modules()
         
+        # 初始化上下文信息更新定时器（必须在QApplication创建之后）
+        self.context_info_timer = QTimer()
+        self.context_info_timer.timeout.connect(self._update_context_info_tooltip)
+        self.context_info_timer.start(1000)  # 每秒更新一次
+        
         # 不再检查VR状态
     
     def _connect_signals(self) -> None:
@@ -544,6 +549,7 @@ class TranslatorApp:
                                         print("警告: API密钥未设置，无法翻译")
                                         self.is_waiting_for_response = False
                                         continue
+                                    print(f'AI翻译上下文:{request["context_prompt"]}')
                                     # 使用AI翻译
                                     start_time = time.time()
                                     result = loop.run_until_complete(
@@ -1360,6 +1366,14 @@ class TranslatorApp:
             print(f"保存设置失败: {e}")
             self.window.show_error("错误", f"保存设置失败: {e}")
     
+    def _update_context_info_tooltip(self) -> None:
+        """更新上下文信息tooltip"""
+        try:
+            context_detail = self.context_manager.get_context_detail()
+            self.window.update_context_info_tooltip(context_detail)
+        except Exception as e:
+            print(f"更新上下文信息tooltip失败: {e}")
+    
     def run(self) -> int:
         """运行应用"""
         self.window.show()
@@ -1367,6 +1381,10 @@ class TranslatorApp:
     
     def cleanup(self) -> None:
         """清理资源"""
+        # 停止上下文信息更新定时器
+        if hasattr(self, 'context_info_timer'):
+            self.context_info_timer.stop()
+        
         # 关闭所有功能
         if self.is_translating:
             self.stop_translation()

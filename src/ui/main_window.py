@@ -920,6 +920,13 @@ class MainWindow(QMainWindow):
         self.instant_translate_trigger_chars_spin.setValue(trans_config.get("instant_translate_trigger_chars", 8))
         instant_config_layout.addWidget(self.instant_translate_trigger_chars_spin)
         
+        # 上下文信息提示标签
+        self.context_info_label = QLabel("?")
+        self.context_info_label.setStyleSheet("color: #888; font-size: 14px; font-weight: bold;")
+        self.context_info_label.setToolTip("AI翻译前文参考:\n（无上下文）")
+        self.context_info_label.setCursor(Qt.CursorShape.PointingHandCursor)
+        instant_config_layout.addWidget(self.context_info_label)
+        
         instant_config_layout.addStretch()
         layout.addLayout(instant_config_layout)
         
@@ -1681,6 +1688,16 @@ class MainWindow(QMainWindow):
     def set_recognition_button_enabled(self, enabled: bool) -> None:
         """设置识别按钮启用状态"""
         self.recognition_btn.setEnabled(enabled)
+    
+    def update_context_info_tooltip(self, context_detail: str) -> None:
+        """
+        更新上下文信息提示标签的tooltip
+        
+        Args:
+            context_detail: 详细的上下文信息字符串
+        """
+        tooltip_text = f"AI翻译前文参考:\n{context_detail}"
+        self.context_info_label.setToolTip(tooltip_text)
     
     def _update_translation_button_state(self) -> None:
         """更新翻译按钮的启用状态"""

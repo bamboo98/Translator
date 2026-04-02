@@ -115,6 +115,55 @@ class WeightedContextManager:
         
         return "\n".join(context_lines)
     
+    def get_context_detail(self) -> str:
+        """
+        获取详细的上下文字符串（包含当前权重和剩余保存时间）
+        
+        Returns:
+            格式化的详细上下文字符串，每行包含：文本、当前权重、剩余时间(秒)
+        """
+        if not self.contexts:
+            return "（无上下文）"
+        
+        current_time = time.time()
+        
+        # 计算每个上下文的当前权重和剩余时间
+        items_with_detail = []
+        for item in self.contexts:
+            elapsed = current_time - item.timestamp
+            remaining_time = max(0.0, self.memory_time - elapsed)
+            current_weight = item.get_current_weight(self.memory_time, current_time)
+            items_with_detail.append((item, current_weight, remaining_time))
+        
+        # 排序规则：与get_context相同
+        def sort_key(item_detail):
+            item, current_weight, _ = item_detail
+            if current_weight > 0:
+                return (-current_weight, 0)
+            else:
+                return (0, -item.timestamp)
+        
+        items_with_detail.sort(key=sort_key)
+        
+        # 移除超出最大条数的缓存
+        if len(items_with_detail) > self.max_count:
+            items_with_detail = items_with_detail[:self.max_count]
+        
+        # 格式化输出
+        detail_lines = []
+        for item, current_weight, remaining_time in items_with_detail:
+            # 格式化权重（保留1位小数）
+            weight_str = f"{current_weight:.1f}"
+            # 格式化剩余时间（保留1位小数）
+            time_str = f"{remaining_time:.1f}"
+            # 限制文本长度，避免tooltip过长
+            text = item.text
+            if len(text) > 50:
+                text = text[:47] + "..."
+            detail_lines.append(f"权重:{weight_str} | {time_str}秒 | {text}")
+        
+        return "\n".join(detail_lines)
+    
     def get_last_text(self) -> str:
         """
         获取上一句话的原文
