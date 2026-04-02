@@ -36,8 +36,9 @@ ENV/
 # 配置文件（包含敏感信息）
 config.json
 
-# 模型文件（通常很大）
-models/
+# models 下各语言模型目录不提交；保留说明文件（需同时解除 models 目录才可跟踪 README）
+models/*
+!models/README.md
 *.model
 *.bin
 

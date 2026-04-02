@@ -1,69 +1,74 @@
-name: Build and Release
-
-on:
-  push:
-    tags:
-      - 'v*'
-
-jobs:
-  build:
-    runs-on: windows-latest
-    # Windows 默认控制台为 cp1252，Python print 中文会触发 UnicodeEncodeError
-    env:
-      PYTHONIOENCODING: utf-8
-
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v2
-
-    - name: Set up Python
-      uses: actions/setup-python@v2
-      with:
-        python-version: '3.11.9'
-
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip &&
-        pip install pyinstaller &&
-        pip install pipreqs &&
-        pipreqs src --encoding=utf8 --savepath src/requirementstemp.txt &&
-        pip install -r requirements.txt &&
-        pip install -r src/requirementstemp.txt
-
-    - name: Build executable
-      run: |
-        python build.py
-
-    - name: Move executable to root
-      run: |
-        move dist\Translator\Translator.exe .
-
-    - name: Get current commit ID
-      run: |
-        echo $env:GITHUB_SHA > version
-      shell: pwsh
-
-    - name: Create zip file
-      run: |
-        powershell Compress-Archive -Path Translator.exe, assets, version -DestinationPath Translator.zip
-      
-    - name: Create Release
-      id: create_release
-      uses: actions/create-release@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        tag_name: ${{ github.ref }}
-        release_name: Release ${{ github.ref }}
-        draft: false
-        prerelease: false
-
-    - name: Upload Release Asset
-      uses: actions/upload-release-asset@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ steps.create_release.outputs.upload_url }}
-        asset_path: ./Translator.zip
-        asset_name: Translator.zip
-        asset_content_type: application/zip
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: windows-latest
+    # Windows 默认控制台为 cp1252，Python print 中文会触发 UnicodeEncodeError
+    env:
+      PYTHONIOENCODING: utf-8
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v2
+
+    - name: Set up Python
+      uses: actions/setup-python@v2
+      with:
+        python-version: '3.11.9'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip &&
+        pip install pyinstaller &&
+        pip install pipreqs &&
+        pipreqs src --encoding=utf8 --savepath src/requirementstemp.txt &&
+        pip install -r requirements.txt &&
+        pip install -r src/requirementstemp.txt
+
+    - name: Build executable
+      run: |
+        python build.py
+
+    - name: Prepare release bundle
+      shell: pwsh
+      run: |
+        if (-not (Test-Path "dist\Translator\Translator.exe")) { throw "Missing dist\Translator\Translator.exe" }
+        if (-not (Test-Path "dist\Translator\_internal")) { throw "Missing dist\Translator\_internal" }
+        if (-not (Test-Path "models\README.md")) { throw "Missing models\README.md" }
+        New-Item -ItemType Directory -Path release_bundle -Force | Out-Null
+        Copy-Item -Path "dist\Translator\Translator.exe" -Destination "release_bundle\"
+        Copy-Item -Path "dist\Translator\_internal" -Destination "release_bundle\_internal" -Recurse
+        New-Item -ItemType Directory -Path "release_bundle\models" -Force | Out-Null
+        Copy-Item -Path "models\README.md" -Destination "release_bundle\models\"
+
+    - name: Create zip file
+      shell: pwsh
+      run: |
+        $items = Get-ChildItem -LiteralPath release_bundle
+        Compress-Archive -Path $items.FullName -DestinationPath Translator.zip -Force
+
+    - name: Create Release
+      id: create_release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ github.ref }}
+        release_name: Release ${{ github.ref }}
+        draft: false
+        prerelease: false
+
+    - name: Upload Release Asset
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./Translator.zip
+        asset_name: Translator.zip
+        asset_content_type: application/zip
